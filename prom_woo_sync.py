@@ -18,7 +18,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    sys.exit(
+        "Помилка: пакет 'python-dotenv' не встановлений.\n"
+        "Встанови його командою: pip install python-dotenv"
+    )
 
 # ============================================================
 # НАЛАШТУВАННЯ
