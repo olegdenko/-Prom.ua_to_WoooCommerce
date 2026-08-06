@@ -10,35 +10,61 @@
 """
 
 import logging
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
 
 # ============================================================
-# НАЛАШТУВАННЯ — заповни своїми даними
+# НАЛАШТУВАННЯ
+# ============================================================
+# Чутливі дані (URL магазину, ключі API) НЕ зберігаються тут.
+# Вони читаються з файлу .env, що лежить поруч зі скриптом.
+# Дивись приклад: prom_woo_sync.env.example
 # ============================================================
 
-# Посилання на фід партнера (те, що ти вже отримав)
-FEED_URL = "https://olibra.com.ua/google_merchant_center.xml?hash_tag=0a95d89def2cfec362187b79040d518f&product_ids=&label_ids=&export_lang=uk&group_ids="
+SCRIPT_DIR = Path(__file__).resolve().parent
+ENV_PATH = SCRIPT_DIR / ".env"
+
+if not ENV_PATH.exists():
+    sys.exit(
+        f"Не знайдено файл {ENV_PATH}\n"
+        f"Скопіюй prom_woo_sync.env.example у .env і заповни своїми даними."
+    )
+
+load_dotenv(ENV_PATH)
+
+
+def require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(f"У файлі .env відсутнє обов'язкове значення: {name}")
+    return value
+
+
+# Посилання на фід партнера
+FEED_URL = require_env("FEED_URL")
 
 # Дані твого WooCommerce магазину
-WC_URL = "https://твій-магазин.com"              # без слешу в кінці
-WC_CONSUMER_KEY = "ck_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-WC_CONSUMER_SECRET = "cs_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+WC_URL = require_env("WC_URL").rstrip("/")
+WC_CONSUMER_KEY = require_env("WC_CONSUMER_KEY")
+WC_CONSUMER_SECRET = require_env("WC_CONSUMER_SECRET")
 
 # Твоя націнка (0.20 = +20% до ціни партнера)
-MARKUP = 0.20
+MARKUP = float(os.environ.get("MARKUP", "0.20"))
 
 # Префікс для SKU у твоєму магазині, щоб уникнути конфліктів
 # з іншими товарами (наприклад "OLB-47718573")
-SKU_PREFIX = "OLB-"
+SKU_PREFIX = os.environ.get("SKU_PREFIX", "OLB-")
 
 # Якщо True — товари, яких більше немає у фіді партнера, будуть
 # автоматично переведені у статус "draft" (приховані) у твоєму магазині.
-DEACTIVATE_MISSING = True
+DEACTIVATE_MISSING = os.environ.get("DEACTIVATE_MISSING", "true").lower() == "true"
 
 # Розмір сторінки при запитах до WooCommerce (макс. 100)
 WC_PER_PAGE = 100
