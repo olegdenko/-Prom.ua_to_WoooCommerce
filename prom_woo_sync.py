@@ -3,19 +3,24 @@
 Синхронізація товарів з Prom.ua (Google Merchant XML фід партнера) у WooCommerce.
 
 Забирає товари з публічного XML-фіда, застосовує націнку, і створює/оновлює
-відповідні товари у твоєму WooCommerce магазині (за SKU = g:id з фіда).
+відповідні товари у твоєму WooCommerce магазині (за SKU = g:id з фіда),
+включно з побудовою дерева категорій.
 
-Запуск вручну:      python3 prom_woo_sync.py
+Запуск вручну:      python prom_woo_sync.py
 Запуск через cron:  0 */3 * * * /usr/bin/python3 /path/to/prom_woo_sync.py >> /var/log/prom_sync.log 2>&1
 """
+
+from __future__ import annotations
 
 import logging
 import os
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import requests
 
@@ -24,7 +29,7 @@ try:
 except Exception:
     # Простий замінник load_dotenv, щоб скрипт міг працювати без залежності
     def load_dotenv(path=None):
-        """Простіше завантаження .env-файлу в os.environ.
+        """Просте завантаження .env-файлу в os.environ.
         Підтримує лише ключ=значення та пропускає коментарі/порожні рядки.
         """
         p = Path(path) if path else None
@@ -47,7 +52,7 @@ except Exception:
 # НАЛАШТУВАННЯ
 # ============================================================
 # Чутливі дані (URL магазину, ключі API) НЕ зберігаються тут.
-# Вони читаються з файлу .env, що лежить поруч зі скриптом.
+# Вони читаються з файлу prom_woo_sync.env, що лежить поруч зі скриптом.
 # Дивись приклад: prom_woo_sync.env.example
 # ============================================================
 
@@ -57,7 +62,7 @@ ENV_PATH = SCRIPT_DIR / "prom_woo_sync.env"
 if not ENV_PATH.exists():
     sys.exit(
         f"Не знайдено файл {ENV_PATH}\n"
-        f"Скопіюй prom_woo_sync.env.example у .env і заповни своїми даними."
+        f"Скопіюй prom_woo_sync.env.example у prom_woo_sync.env і заповни своїми даними."
     )
 
 load_dotenv(ENV_PATH)
@@ -66,7 +71,7 @@ load_dotenv(ENV_PATH)
 def require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
-        sys.exit(f"У файлі .env відсутнє обов'язкове значення: {name}")
+        sys.exit(f"У файлі prom_woo_sync.env відсутнє обов'язкове значення: {name}")
     return value
 
 
@@ -89,6 +94,19 @@ SKU_PREFIX = os.environ.get("SKU_PREFIX", "OLB-")
 # автоматично переведені у статус "draft" (приховані) у твоєму магазині.
 DEACTIVATE_MISSING = os.environ.get("DEACTIVATE_MISSING", "true").lower() == "true"
 
+# ---- ЗАХИСТ ВІД АВАРІЙНОГО СЦЕНАРІЮ ----
+# Якщо фід партнера раптом стане недоступним/порожнім/урізаним (Prom впав,
+# токен протух, партнер щось зламав) — без цього захисту скрипт вирішить,
+# що "всі товари зникли", і масово поховає весь магазин. MIN_FEED_RATIO —
+# мінімальна частка від попереднього успішного результату, нижче якої
+# скрипт зупиняється і НІЧОГО не змінює в магазині.
+MIN_FEED_RATIO = float(os.environ.get("MIN_FEED_RATIO", "0.7"))
+STATE_FILE = SCRIPT_DIR / "sync_state.json"
+
+# ---- TELEGRAM-СПОВІЩЕННЯ ПРО ПОМИЛКИ (опційно) ----
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 # Розмір сторінки при запитах до WooCommerce (макс. 100)
 WC_PER_PAGE = 100
 
@@ -100,6 +118,58 @@ logging.basicConfig(
 log = logging.getLogger("prom_woo_sync")
 
 NS = {"g": "http://base.google.com/ns/1.0"}
+
+
+def _request_with_retry(method: str, url: str, max_retries: int = 3, **kwargs) -> requests.Response:
+    """
+    Обгортка над requests з повторними спробами при мережевих обривах
+    (наприклад, ноутбук заснув / втратив Wi-Fi на секунду / сервер моргнув).
+    НЕ повторює спроби при звичайних HTTP-помилках (400, 404 тощо) —
+    тільки при справжніх мережевих збоях, де відповіді взагалі не було.
+    """
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return requests.request(method, url, **kwargs)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_exc = exc
+            wait = 5 * attempt
+            log.warning(
+                "Мережева помилка (спроба %d/%d): %s. Повтор через %d сек...",
+                attempt, max_retries, exc, wait,
+            )
+            time.sleep(wait)
+    raise last_exc
+
+
+def notify_telegram(message: str):
+    """Надсилає сповіщення в Telegram, якщо налаштовано. Тихо ігнорує помилки
+    самого сповіщення (не можна, щоб впала сама сповіщувалка)."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=15,
+        )
+    except Exception as exc:
+        log.warning("Не вдалося надіслати сповіщення в Telegram: %s", exc)
+
+
+def load_last_feed_count() -> int | None:
+    import json
+    if not STATE_FILE.exists():
+        return None
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8")).get("last_feed_count")
+    except Exception:
+        return None
+
+
+def save_last_feed_count(count: int):
+    import json
+    STATE_FILE.write_text(json.dumps({"last_feed_count": count}), encoding="utf-8")
 
 
 # ============================================================
@@ -140,7 +210,7 @@ def parse_price(raw: str) -> float:
 
 def fetch_feed_products() -> list[FeedProduct]:
     log.info("Завантажую фід партнера: %s", FEED_URL)
-    resp = requests.get(FEED_URL, timeout=60)
+    resp = _request_with_retry("GET", FEED_URL, timeout=60)
     resp.raise_for_status()
 
     root = ET.fromstring(resp.content)
@@ -187,14 +257,22 @@ class WooClient:
         self.auth = (key, secret)
 
     def get_all_products_by_sku(self) -> dict:
-        """Повертає {sku: product_id} для всіх товарів з нашим префіксом."""
+        """
+        Повертає {sku: product_id} для всіх товарів з нашим префіксом.
+
+        Важливо: параметр ?search= у WooCommerce REST API робить повнотекстовий
+        пошук по назві/опису, а НЕ по SKU — покладатись на нього для пошуку за
+        SKU-префіксом ненадійно (продукти "губляться", і скрипт намагається
+        створити дублікат із тим самим SKU, що WooCommerce відхиляє з 400).
+        Тому тут просто перебираємо всі товари магазину і фільтруємо на своєму боці.
+        """
         result = {}
         page = 1
         while True:
-            resp = requests.get(
-                f"{self.base}/products",
+            resp = _request_with_retry(
+                "GET", f"{self.base}/products",
                 auth=self.auth,
-                params={"per_page": WC_PER_PAGE, "page": page, "search": SKU_PREFIX},
+                params={"per_page": WC_PER_PAGE, "page": page},
                 timeout=60,
             )
             resp.raise_for_status()
@@ -202,25 +280,103 @@ class WooClient:
             if not batch:
                 break
             for p in batch:
-                if p.get("sku", "").startswith(SKU_PREFIX):
-                    result[p["sku"]] = p["id"]
+                sku = p.get("sku", "")
+                if sku.startswith(SKU_PREFIX):
+                    result[sku] = p["id"]
             page += 1
         return result
 
     def create_product(self, payload: dict) -> int:
-        resp = requests.post(f"{self.base}/products", auth=self.auth, json=payload, timeout=60)
+        resp = _request_with_retry("POST", f"{self.base}/products", auth=self.auth, json=payload, timeout=60)
+        if not resp.ok:
+            log.error("Тіло відповіді WooCommerce: %s", resp.text[:500])
         resp.raise_for_status()
         return resp.json()["id"]
 
     def update_product(self, product_id: int, payload: dict):
-        resp = requests.put(f"{self.base}/products/{product_id}", auth=self.auth, json=payload, timeout=60)
+        resp = _request_with_retry("PUT", f"{self.base}/products/{product_id}", auth=self.auth, json=payload, timeout=60)
+        if not resp.ok:
+            log.error("Тіло відповіді WooCommerce: %s", resp.text[:500])
         resp.raise_for_status()
 
     def set_status(self, product_id: int, status: str):
         self.update_product(product_id, {"status": status})
 
+    # ------------------------------------------------------------
+    # Категорії
+    # ------------------------------------------------------------
 
-def build_payload(p: FeedProduct) -> dict:
+    def get_all_categories(self) -> dict:
+        """Повертає {(parent_id, name_lower): id} для всіх категорій, що вже є."""
+        result = {}
+        page = 1
+        while True:
+            resp = _request_with_retry(
+                "GET", f"{self.base}/products/categories",
+                auth=self.auth,
+                params={"per_page": WC_PER_PAGE, "page": page},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            batch = resp.json()
+            if not batch:
+                break
+            for c in batch:
+                result[(c["parent"], c["name"].strip().lower())] = c["id"]
+            page += 1
+        return result
+
+    def create_category(self, name: str, parent_id: int) -> int:
+        resp = _request_with_retry(
+            "POST", f"{self.base}/products/categories",
+            auth=self.auth,
+            json={"name": name, "parent": parent_id},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+
+class CategoryTree:
+    """
+    Будує/кешує дерево категорій WooCommerce з рядка типу
+    'Електроніка > Телефони > Смартфони'.
+
+    Категорії, що вже існують у магазині, підхоплюються один раз на старті
+    (щоб не створювати дублікати при повторних запусках), нові —
+    створюються по ходу і додаються в той самий кеш.
+    """
+
+    def __init__(self, wc: "WooClient"):
+        self.wc = wc
+        self.cache = wc.get_all_categories()  # {(parent_id, name_lower): id}
+
+    def resolve(self, category_path: str) -> Optional[int]:
+        path = [part.strip() for part in category_path.split(">") if part.strip()]
+        # Prom іноді віддає в product_type просто число (ID власної категорії) —
+        # це не назва, і саме воно давало "цифри замість назв" у старому синку.
+        # Такі сегменти пропускаємо.
+        path = [part for part in path if not part.isdigit()]
+
+        if not path:
+            return None
+
+        parent_id = 0
+        leaf_id = None
+        for name in path:
+            key = (parent_id, name.lower())
+            if key in self.cache:
+                leaf_id = self.cache[key]
+            else:
+                leaf_id = self.wc.create_category(name, parent_id)
+                self.cache[key] = leaf_id
+                log.info("Створено категорію '%s' (батько ID=%d)", name, parent_id)
+            parent_id = leaf_id
+
+        return leaf_id
+
+
+def build_payload(p: FeedProduct, category_id: Optional[int] = None) -> dict:
     images = [{"src": p.image}] if p.image else []
     images += [{"src": url} for url in p.extra_images]
 
@@ -237,14 +393,14 @@ def build_payload(p: FeedProduct) -> dict:
         "images": images,
     }
 
-    if p.brand:
-        payload["attributes"] = payload.get("attributes", [])
-
     if p.attributes:
         payload["attributes"] = [
             {"name": name, "options": [value], "visible": True}
             for name, value in list(p.attributes.items())[:10]  # ліміт, щоб не роздувати запит
         ]
+
+    if category_id is not None:
+        payload["categories"] = [{"id": category_id}]
 
     return payload
 
@@ -254,19 +410,53 @@ def build_payload(p: FeedProduct) -> dict:
 # ============================================================
 
 def sync():
-    feed_products = fetch_feed_products()
-    wc = WooClient(WC_URL, WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
+    # ---- Крок 1: фід партнера. Якщо Prom/olibra недоступний — виходимо,
+    # нічого в магазині не чіпаючи. ----
+    try:
+        feed_products = fetch_feed_products()
+    except requests.RequestException as e:
+        msg = f"⚠️ Prom-sync: не вдалося завантажити фід партнера — {e}"
+        log.error(msg)
+        notify_telegram(msg)
+        sys.exit(1)
 
-    log.info("Отримую список товарів, які вже є у WooCommerce...")
-    existing = wc.get_all_products_by_sku()
+    # ---- Захист від "фід порожній/урізаний -> скрипт ховає весь магазин" ----
+    last_count = load_last_feed_count()
+    if last_count and len(feed_products) < last_count * MIN_FEED_RATIO:
+        msg = (
+            f"⚠️ Prom-sync: фід партнера повернув лише {len(feed_products)} товарів "
+            f"(було {last_count}). Це менше порогу {int(MIN_FEED_RATIO * 100)}% — "
+            f"схоже на збій, а не реальне зникнення товарів. Синхронізацію ЗУПИНЕНО, "
+            f"магазин не змінено. Перевір фід вручну."
+        )
+        log.error(msg)
+        notify_telegram(msg)
+        sys.exit(1)
+
+    # ---- Крок 2: WooCommerce. Якщо твій сервер (IIS) недоступний — теж просто виходимо. ----
+    wc = WooClient(WC_URL, WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
+    try:
+        log.info("Отримую список товарів, які вже є у WooCommerce...")
+        existing = wc.get_all_products_by_sku()
+    except requests.RequestException as e:
+        msg = f"⚠️ Prom-sync: WooCommerce/сайт недоступний — {e}"
+        log.error(msg)
+        notify_telegram(msg)
+        sys.exit(1)
+
     log.info("У WooCommerce вже є %d товарів з префіксом '%s'", len(existing), SKU_PREFIX)
+
+    log.info("Завантажую/готую дерево категорій...")
+    categories = CategoryTree(wc)
 
     created, updated, failed = 0, 0, 0
     seen_skus = set()
+    missing_skus = set()
 
     for p in feed_products:
         seen_skus.add(p.sku)
-        payload = build_payload(p)
+        category_id = categories.resolve(p.category_path) if p.category_path else None
+        payload = build_payload(p, category_id)
         try:
             if p.sku in existing:
                 wc.update_product(existing[p.sku], payload)
@@ -287,15 +477,22 @@ def sync():
             except requests.HTTPError as e:
                 log.error("Не вдалося приховати %s: %s", sku, e)
 
-    log.info(
-        "Готово. Створено: %d, оновлено: %d, помилок: %d, приховано: %d",
-        created, updated, failed, len(missing_skus) if DEACTIVATE_MISSING else 0,
+    save_last_feed_count(len(feed_products))
+
+    summary = (
+        f"Готово. Створено: {created}, оновлено: {updated}, помилок: {failed}, "
+        f"приховано: {len(missing_skus) if DEACTIVATE_MISSING else 0}"
     )
+    log.info(summary)
+
+    if failed > 0:
+        notify_telegram(f"⚠️ Prom-sync завершено з помилками.\n{summary}")
 
 
 if __name__ == "__main__":
     try:
         sync()
-    except Exception:
+    except Exception as e:
         log.exception("Синхронізація завершилась з критичною помилкою")
+        notify_telegram(f"🔴 Prom-sync: критична помилка — {e}")
         sys.exit(1)
