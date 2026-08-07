@@ -20,12 +20,28 @@ from pathlib import Path
 import requests
 
 try:
-    from dotenv import load_dotenv
-except ImportError:
-    sys.exit(
-        "Помилка: пакет 'python-dotenv' не встановлений.\n"
-        "Встанови його командою: pip install python-dotenv"
-    )
+    from dotenv import load_dotenv  # type: ignore
+except Exception:
+    # Простий замінник load_dotenv, щоб скрипт міг працювати без залежності
+    def load_dotenv(path=None):
+        """Простіше завантаження .env-файлу в os.environ.
+        Підтримує лише ключ=значення та пропускає коментарі/порожні рядки.
+        """
+        p = Path(path) if path else None
+        if p is None or not p.exists():
+            return False
+        with p.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                os.environ.setdefault(key, val)
+        return True
 
 # ============================================================
 # НАЛАШТУВАННЯ
@@ -36,7 +52,7 @@ except ImportError:
 # ============================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ENV_PATH = SCRIPT_DIR / ".env"
+ENV_PATH = SCRIPT_DIR / "prom_woo_sync.env"
 
 if not ENV_PATH.exists():
     sys.exit(
