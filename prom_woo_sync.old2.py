@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -56,41 +55,6 @@ except Exception:
 # Вони читаються з файлу prom_woo_sync.env, що лежить поруч зі скриптом.
 # Дивись приклад: prom_woo_sync.env.example
 # ============================================================
-
-# ============================================================
-# ТРАНСЛІТЕРАЦІЯ - генеруємо латиничні slug'и самі, щоб не залежати
-# від сторонніх плагінів типу Cyr-To-Lat (які, як ми з'ясували,
-# можуть мати власні баги і конфлікти з WooCommerce).
-# ============================================================
-
-_TRANSLIT_MAP = {
-    "а": "a", "б": "b", "в": "v", "г": "h", "ґ": "g", "д": "d",
-    "е": "e", "є": "ie", "ж": "zh", "з": "z", "и": "y", "і": "i",
-    "ї": "yi", "й": "i", "к": "k", "л": "l", "м": "m", "н": "n",
-    "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
-    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
-    "ь": "", "ю": "iu", "я": "ia", "'": "", "’": "", "«": "", "»": "",
-    # російські літери, яких немає в українському алфавіті - про всяк випадок
-    "ё": "e", "ъ": "", "ы": "y", "э": "e",
-}
-
-
-def slugify_uk(text: str, max_length: int = 60) -> str:
-    """Перетворює кириличний (або будь-який) текст у латиничний slug,
-    придатний для URL: 'Зоотовари' -> 'zootovary'."""
-    text = text.lower().strip()
-    out = []
-    for ch in text:
-        if ch in _TRANSLIT_MAP:
-            out.append(_TRANSLIT_MAP[ch])
-        elif ch.isalnum() and ch.isascii():
-            out.append(ch)
-        else:
-            out.append("-")
-    slug = "".join(out)
-    slug = re.sub(r"-+", "-", slug).strip("-")
-    return slug[:max_length].rstrip("-") or "item"
-
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / "prom_woo_sync.env"
@@ -145,12 +109,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Розмір сторінки при запитах до WooCommerce (макс. 100)
 WC_PER_PAGE = 100
-
-# Пауза між запитами створення/оновлення товару (секунди). На слабкому сервері
-# (старий CPU, мало RAM) без цього IIS одночасно піднімає забагато php-cgi
-# процесів і навантаження на CPU впирається у 90-100%. Невелика затримка
-# розтягує синхронізацію в часі, зате не кладе сервер.
-REQUEST_DELAY_SECONDS = float(os.environ.get("REQUEST_DELAY_SECONDS", "0.5"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -368,18 +326,13 @@ class WooClient:
             page += 1
         return result
 
-    def create_category(self, name: str, parent_id: int, image_url: str = "") -> int:
-        payload = {"name": name, "parent": parent_id, "slug": slugify_uk(name)}
-        if image_url:
-            payload["image"] = {"src": image_url}
+    def create_category(self, name: str, parent_id: int) -> int:
         resp = _request_with_retry(
             "POST", f"{self.base}/products/categories",
             auth=self.auth,
-            json=payload,
+            json={"name": name, "parent": parent_id},
             timeout=60,
         )
-        if not resp.ok:
-            log.error("Тіло відповіді WooCommerce (категорія '%s'): %s", name, resp.text[:500])
         resp.raise_for_status()
         return resp.json()["id"]
 
@@ -422,76 +375,6 @@ class CategoryTree:
 
         return leaf_id
 
-    def resolve_from_chain(self, chain: list[tuple[str, str]]) -> Optional[int]:
-        """
-        Те саме, що resolve(), але приймає готовий ланцюжок [(назва, фото), ...]
-        від кореня до листа - саме так, як його будує PartnerCategoryMap
-        з даних, зібраних olibra_categories_scraper.py (чи аналогічним
-        скриптом для іншого сайту-партнера).
-        """
-        if not chain:
-            return None
-        parent_id = 0
-        leaf_id = None
-        for name, image_url in chain:
-            key = (parent_id, name.lower())
-            if key in self.cache:
-                leaf_id = self.cache[key]
-            else:
-                leaf_id = self.wc.create_category(name, parent_id, image_url=image_url)
-                self.cache[key] = leaf_id
-                log.info("Створено категорію '%s' (батько ID=%d)%s", name, parent_id,
-                         " з фото" if image_url else "")
-            parent_id = leaf_id
-        return leaf_id
-
-
-class PartnerCategoryMap:
-    """
-    Читає файли, згенеровані скриптом-краулером сайту партнера
-    (наприклад olibra_categories_scraper.py), і дає змогу знайти правильний
-    ланцюжок категорій (з фото) для конкретного товару за його id з фіда.
-
-    Якщо файли відсутні - просто вимкнено (products_by_id порожній),
-    і скрипт синхронізації відкотиться на product_type з фіда як раніше.
-    """
-
-    def __init__(self, categories_file: Path, product_map_file: Path):
-        self.enabled = categories_file.exists() and product_map_file.exists()
-        self.nodes: dict[str, dict] = {}   # slug -> {name, parent_slug, image}
-        self.product_to_slug: dict[str, str] = {}
-
-        if not self.enabled:
-            return
-
-        for node in json.loads(categories_file.read_text(encoding="utf-8")):
-            self.nodes[node["slug"]] = node
-        self.product_to_slug = json.loads(product_map_file.read_text(encoding="utf-8"))
-        log.info(
-            "PartnerCategoryMap: завантажено %d категорій, %d товарів з мапи партнера",
-            len(self.nodes), len(self.product_to_slug),
-        )
-
-    def chain_for_product(self, source_id: str) -> Optional[list[tuple[str, str]]]:
-        if not self.enabled:
-            return None
-        slug = self.product_to_slug.get(source_id)
-        if not slug or slug not in self.nodes:
-            return None
-
-        chain = []
-        cur = slug
-        seen = set()
-        while cur and cur not in seen:
-            seen.add(cur)
-            node = self.nodes.get(cur)
-            if not node:
-                break
-            chain.append((node["name"], node.get("image") or ""))
-            cur = node.get("parent_slug")
-        chain.reverse()
-        return chain or None
-
 
 def build_payload(p: FeedProduct, category_id: Optional[int] = None) -> dict:
     images = [{"src": p.image}] if p.image else []
@@ -500,7 +383,6 @@ def build_payload(p: FeedProduct, category_id: Optional[int] = None) -> dict:
     payload = {
         "name": p.title,
         "sku": p.sku,
-        "slug": f"{slugify_uk(p.title, max_length=50)}-{p.source_id}",
         "regular_price": str(p.sale_price),
         "description": p.description,
         "short_description": p.description[:300],
@@ -566,14 +448,6 @@ def sync():
 
     log.info("Завантажую/готую дерево категорій...")
     categories = CategoryTree(wc)
-    partner_map = PartnerCategoryMap(
-        SCRIPT_DIR / "olibra_categories.json",
-        SCRIPT_DIR / "olibra_product_map.json",
-    )
-    if partner_map.enabled:
-        log.info("Використовую точну структуру категорій партнера (замість product_type з фіда)")
-    else:
-        log.info("Файли мапи партнера не знайдено - використовую product_type з фіда")
 
     created, updated, failed = 0, 0, 0
     seen_skus = set()
@@ -581,25 +455,11 @@ def sync():
 
     for p in feed_products:
         seen_skus.add(p.sku)
-        category_id = None
-        try:
-            chain = partner_map.chain_for_product(p.source_id)
-            if chain:
-                category_id = categories.resolve_from_chain(chain)
-            elif p.category_path:
-                category_id = categories.resolve(p.category_path)
-        except requests.HTTPError as e:
-            log.error("Не вдалося створити/знайти категорію для %s: %s", p.sku, e)
+        category_id = categories.resolve(p.category_path) if p.category_path else None
         payload = build_payload(p, category_id)
         try:
             if p.sku in existing:
-                # ВАЖЛИВО: не шлемо 'sku' при оновленні. Це офіційно підтверджений
-                # баг WooCommerce (github.com/woocommerce/woocommerce/issues/33806) -
-                # PUT з тим самим SKU, який товар вже має, іноді помилково
-                # трактується як "SKU вже зайнятий іншим товаром". SKU й так
-                # не змінюється при оновленні, тому просто прибираємо поле.
-                update_payload = {k: v for k, v in payload.items() if k not in ("sku", "slug")}
-                wc.update_product(existing[p.sku], update_payload)
+                wc.update_product(existing[p.sku], payload)
                 updated += 1
             else:
                 wc.create_product(payload)
@@ -607,9 +467,6 @@ def sync():
         except requests.HTTPError as e:
             failed += 1
             log.error("Помилка для товару %s (%s): %s", p.sku, p.title, e)
-
-        if REQUEST_DELAY_SECONDS > 0:
-            time.sleep(REQUEST_DELAY_SECONDS)
 
     if DEACTIVATE_MISSING:
         missing_skus = set(existing.keys()) - seen_skus
