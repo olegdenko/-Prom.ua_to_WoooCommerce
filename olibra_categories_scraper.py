@@ -136,7 +136,7 @@ TREE = [
     ("Biom", "g68254607-biom", "g22011410-lampochki"),
 ]
 
-PRODUCT_RE = re.compile(r'href="https://olibra\.com\.ua/ua/p(\d+)-[^"]*\.html"')
+PRODUCT_RE = re.compile(r'href="(?:https://olibra\.com\.ua)?/ua/p(\d+)-[^"]*\.html"')
 OG_IMAGE_RE = re.compile(r'<meta property="og:image" content="([^"]+)"')
 
 
