@@ -136,6 +136,10 @@ TREE = [
     ("Biom", "g68254607-biom", "g22011410-lampochki"),
 ]
 
+# ФІКС: сайт олібри використовує ВІДНОСНІ href (/ua/p123-slug.html), а не
+# абсолютні (https://olibra.com.ua/ua/p123-slug.html). Стара регулярка
+# вимагала повний домен у href і тому ніколи нічого не знаходила -
+# домен тепер опціональний.
 PRODUCT_RE = re.compile(r'href="(?:https://olibra\.com\.ua)?/ua/p(\d+)-[^"]*\.html"')
 OG_IMAGE_RE = re.compile(r'<meta property="og:image" content="([^"]+)"')
 
@@ -196,8 +200,24 @@ def main():
 
     parent_slugs = {parent for _, _, parent in TREE if parent}
     leaves = [(name, slug, parent) for name, slug, parent in TREE if slug not in parent_slugs]
+    parents_with_page = [(name, slug, parent) for name, slug, parent in TREE if slug in parent_slugs]
 
-    log.info("Всього груп: %d, з них листових (де є товари): %d", len(TREE), len(leaves))
+    # ФІКС: раніше скануванням товарів охоплювались ТІЛЬКИ листові групи -
+    # припускалось, що в батьківських групах (типу "Господарські товари",
+    # "Пластикова продукція", "Канцтовари") товари лежать лише в підгрупах.
+    # Насправді на сайті партнера батьківська сторінка теж може містити
+    # товари НАПРЯМУ (ті, що не віднесені до жодної вужчої підгрупи) -
+    # наприклад "Лійка" лежить прямо в "Пластикова продукція", не в жодній
+    # з її підгруп. Тому тепер скануємо ОБИДВА типи груп:
+    #   1) спочатку листові (вужчі, точніші) - вони мають пріоритет
+    #   2) потім батьківські - як "донабір" для товарів, яких не знайшлось
+    #      у жодній підгрупі
+    scan_order = leaves + parents_with_page
+
+    log.info(
+        "Всього груп: %d (листових: %d, батьківських зі своєю сторінкою: %d)",
+        len(TREE), len(leaves), len(parents_with_page),
+    )
 
     for name, slug, parent in TREE:
         if slug not in images:
@@ -207,7 +227,7 @@ def main():
             save_progress(progress)
             time.sleep(DELAY)
 
-    for name, slug, parent in leaves:
+    for name, slug, parent in scan_order:
         if slug in done_groups:
             log.info("Пропускаю (вже зроблено): %s", name)
             continue
@@ -224,10 +244,15 @@ def main():
     ]
     CATEGORIES_FILE.write_text(json.dumps(categories_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # ВАЖЛИВО: проходимо групи в тому ж порядку пріоритету (листові першими).
+    # Якщо товар зустрічається і в листовій підгрупі, і на сторінці батьківської
+    # групи одночасно - листова (вужча, точніша) перемагає, бо призначається
+    # першою і product_map[pid] далі не перезаписується.
     product_map = {}
-    for slug, ids in done_groups.items():
-        for pid in ids:
-            product_map[pid] = slug
+    for name, slug, parent in scan_order:
+        for pid in done_groups.get(slug, []):
+            if pid not in product_map:
+                product_map[pid] = slug
     PRODUCT_MAP_FILE.write_text(json.dumps(product_map, ensure_ascii=False, indent=2), encoding="utf-8")
 
     log.info("Готово. Категорій: %d, товарів у мапі: %d", len(categories_out), len(product_map))
