@@ -220,7 +220,12 @@ def main():
     )
 
     for name, slug, parent in TREE:
-        if slug not in images:
+        # ФІКС: раніше перевірка "slug not in images" означала, що якщо
+        # спроба забрати фото ОДНОГО РАЗУ провалилась (мережевий збій тощо),
+        # в images[slug] записувався порожній рядок "" - і оскільки ключ
+        # вже був присутній, повторна спроба НІКОЛИ більше не робилась.
+        # Тепер повторюємо спробу, якщо значення порожнє/відсутнє.
+        if not images.get(slug):
             log.info("Фото групи: %s", name)
             img = get_group_image(slug)
             images[slug] = img or ""
