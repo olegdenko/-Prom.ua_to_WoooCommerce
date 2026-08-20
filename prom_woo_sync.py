@@ -25,6 +25,8 @@ from typing import Optional
 
 import requests
 
+from telegram_notify import TelegramNotifier
+
 try:
     from dotenv import load_dotenv  # type: ignore
 except Exception:
@@ -139,9 +141,23 @@ DEACTIVATE_MISSING = os.environ.get("DEACTIVATE_MISSING", "true").lower() == "tr
 MIN_FEED_RATIO = float(os.environ.get("MIN_FEED_RATIO", "0.7"))
 STATE_FILE = SCRIPT_DIR / "sync_state.json"
 
+# ---- ЗАХИСТ ВІД ПАРАЛЕЛЬНОГО ЗАПУСКУ ----
+# Потрібно, бо тепер синхронізацію можна запустити і за розкладом (cron/Task
+# Scheduler), і вручну командою /sync в Telegram - без цього вони можуть
+# накластися одна на одну. LOCK_STALE_SECONDS - якщо лок-файл старший за
+# це значення, вважаємо, що попередній запуск "завис" і ігноруємо лок
+# (щоб один завислий процес не заблокував синхронізацію назавжди).
+LOCK_FILE = SCRIPT_DIR / "sync.lock"
+LOCK_STALE_SECONDS = 2 * 60 * 60  # 2 години
+
 # ---- TELEGRAM-СПОВІЩЕННЯ ПРО ПОМИЛКИ (опційно) ----
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ---- TELEGRAM: "живий" прогрес одним повідомленням (опційно) ----
+# Використовує ті самі TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID. Якщо вони
+# не задані - notifier сам тихо вимикається, нічого не ламаючи.
+notifier = TelegramNotifier(token=TELEGRAM_BOT_TOKEN, chat_id=TELEGRAM_CHAT_ID)
 
 # Розмір сторінки при запитах до WooCommerce (макс. 100)
 WC_PER_PAGE = 100
@@ -579,7 +595,9 @@ def sync():
     seen_skus = set()
     missing_skus = set()
 
-    for p in feed_products:
+    notifier.start(total=len(feed_products), label="Prom-sync: Olibra → WooCommerce")
+
+    for idx, p in enumerate(feed_products, 1):
         seen_skus.add(p.sku)
         category_id = None
         try:
@@ -607,6 +625,9 @@ def sync():
         except requests.HTTPError as e:
             failed += 1
             log.error("Помилка для товару %s (%s): %s", p.sku, p.title, e)
+            notifier.error(f"Товар {p.sku} ({p.title}): {e}")
+
+        notifier.progress(processed=idx, added=created, updated=updated, errors=failed)
 
         if REQUEST_DELAY_SECONDS > 0:
             time.sleep(REQUEST_DELAY_SECONDS)
@@ -628,14 +649,32 @@ def sync():
     )
     log.info(summary)
 
-    if failed > 0:
-        notify_telegram(f"⚠️ Prom-sync завершено з помилками.\n{summary}")
+    notifier.finish(
+        added=created,
+        updated=updated,
+        errors=failed,
+        extra_note=f"Приховано: {len(missing_skus) if DEACTIVATE_MISSING else 0}",
+    )
 
 
 if __name__ == "__main__":
+    if LOCK_FILE.exists() and (time.time() - LOCK_FILE.stat().st_mtime) < LOCK_STALE_SECONDS:
+        log.warning(
+            "Синхронізація вже виконується (знайдено %s) - цей запуск пропущено, "
+            "щоб не накластися на попередній.", LOCK_FILE,
+        )
+        notify_telegram("⏳ Prom-sync: попередній запуск ще виконується — цей запуск пропущено.")
+        sys.exit(0)
+
+    LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
     try:
         sync()
     except Exception as e:
         log.exception("Синхронізація завершилась з критичною помилкою")
         notify_telegram(f"🔴 Prom-sync: критична помилка — {e}")
         sys.exit(1)
+    finally:
+        try:
+            LOCK_FILE.unlink()
+        except FileNotFoundError:
+            pass
