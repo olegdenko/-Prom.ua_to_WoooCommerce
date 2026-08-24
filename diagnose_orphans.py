@@ -20,7 +20,7 @@ def build_id_to_link():
     # шукаємо всі <item>, у кожного беремо g:id і link (не обов'язково з g:)
     for item in root.iter('item'):
         gid = item.find('g:id', NS)
-        link = item.find('link')
+        link = item.find('g:link', NS)
         if gid is not None and link is not None and gid.text and link.text:
             id_to_link[gid.text] = link.text
     return id_to_link
