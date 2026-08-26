@@ -141,6 +141,13 @@ DEACTIVATE_MISSING = os.environ.get("DEACTIVATE_MISSING", "true").lower() == "tr
 MIN_FEED_RATIO = float(os.environ.get("MIN_FEED_RATIO", "0.7"))
 STATE_FILE = SCRIPT_DIR / "sync_state.json"
 
+# ---- САМОДІАГНОСТИКА КАТЕГОРІЙ ПАРТНЕРА ----
+# Сюди щоразу зберігається свіжий список товарів, для яких chain_for_product()
+# не знайшов ланцюжок у мапі партнера (тобто категорія була взята з
+# product_type фіда - "чужа" Prom-таксономія). Читає і обробляє цей файл
+# olibra_categories_scraper.py на своєму наступному (тижневому) запуску.
+ORPHANS_FILE = SCRIPT_DIR / "pending_orphans.json"
+
 # ---- ЗАХИСТ ВІД ПАРАЛЕЛЬНОГО ЗАПУСКУ ----
 # Потрібно, бо тепер синхронізацію можна запустити і за розкладом (cron/Task
 # Scheduler), і вручну командою /sync в Telegram - без цього вони можуть
@@ -242,6 +249,7 @@ class FeedProduct:
     price: float
     in_stock: bool
     image: str
+    link: str = ""  # НОВЕ: потрібно, щоб діагностувати "сиріт" без повторного запиту до фіда
     extra_images: list = field(default_factory=list)
     category_path: str = ""
     brand: str = ""
@@ -295,6 +303,7 @@ def fetch_feed_products() -> list[FeedProduct]:
             price=parse_price(g("price", "0")),
             in_stock=(g("availability") == "in stock"),
             image=g("image_link"),
+            link=g("link"),  # НОВЕ: точне посилання на товар з фіда
             extra_images=images,
             category_path=g("product_type"),
             brand=g("brand"),
@@ -594,6 +603,7 @@ def sync():
     created, updated, failed = 0, 0, 0
     seen_skus = set()
     missing_skus = set()
+    orphans: list[FeedProduct] = []  # НОВЕ: товари без ланцюжка з мапи партнера (fallback на product_type)
 
     notifier.start(total=len(feed_products), label="Prom-sync: Olibra → WooCommerce")
 
@@ -606,6 +616,11 @@ def sync():
                 category_id = categories.resolve_from_chain(chain)
             elif p.category_path:
                 category_id = categories.resolve(p.category_path)
+                if partner_map.enabled:
+                    # НОВЕ: мапа партнера увімкнена, але саме для цього товару
+                    # ланцюжка не знайшлось - фіксуємо як "сироту" для подальшого
+                    # автоматичного аналізу скрапером (olibra_categories_scraper.py)
+                    orphans.append(p)
         except requests.HTTPError as e:
             log.error("Не вдалося створити/знайти категорію для %s: %s", p.sku, e)
         payload = build_payload(p, category_id)
@@ -640,6 +655,19 @@ def sync():
                 log.info("Товар %s відсутній у фіді — переведено в чернетки", sku)
             except requests.HTTPError as e:
                 log.error("Не вдалося приховати %s: %s", sku, e)
+
+    # НОВЕ: зберігаємо свіжий список "сиріт" - його прочитає і опрацює
+    # olibra_categories_scraper.py на своєму наступному запуску (self-healing
+    # прогресу для вже покритих TREE груп + пропозиції нових рядків для TREE).
+    orphans_out = [
+        {"id": o.source_id, "title": o.title, "link": o.link, "category_path": o.category_path}
+        for o in orphans
+    ]
+    ORPHANS_FILE.write_text(json.dumps(orphans_out, ensure_ascii=False, indent=2), encoding="utf-8")
+    log.info(
+        "%d товарів без категорії партнера (fallback на product_type) - збережено в %s",
+        len(orphans_out), ORPHANS_FILE,
+    )
 
     save_last_feed_count(len(feed_products))
 
