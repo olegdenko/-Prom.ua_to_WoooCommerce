@@ -1,0 +1,7 @@
+# HTTP-запити до Prom.ua, WooCommerce та Telegram API
+
+requests>=2.31.0,<3.0.0
+
+# Завантаження налаштувань із .env / prom_woo_sync.env
+
+python-dotenv>=1.0.0,<2.0.0
