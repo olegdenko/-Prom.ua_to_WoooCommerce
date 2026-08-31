@@ -1,9 +1,7 @@
-<<<<<<< HEAD
 certifi==2026.7.22
 charset-normalizer==3.5.0
 idna==3.18
 urllib3==2.7.0
-=======
 # HTTP-запити до Prom.ua, WooCommerce та Telegram API
 
 requests>=2.31.0,<3.0.0
@@ -11,4 +9,3 @@ requests>=2.31.0,<3.0.0
 # Завантаження налаштувань із .env / prom_woo_sync.env
 
 python-dotenv>=1.0.0,<2.0.0
->>>>>>> cef66a5f50a7322812e5e11e21874f98af8cff8d
