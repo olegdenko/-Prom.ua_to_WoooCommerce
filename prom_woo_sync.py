@@ -1,17 +1,3 @@
-# Copyright 2026 Oleh Demydenko
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 #!/usr/bin/env python3
 """
 Синхронізація товарів з Prom.ua (Google Merchant XML фід партнера) у WooCommerce.
@@ -19,6 +5,23 @@
 Забирає товари з публічного XML-фіда, застосовує націнку, і створює/оновлює
 відповідні товари у твоєму WooCommerce магазині (за SKU = g:id з фіда),
 включно з побудовою дерева категорій.
+
+ДЕДУПЛІКАЦІЯ МЕДІА (важливо): WooCommerce REST API, отримавши для товару чи
+категорії {"image": {"src": url}}, ЩОРАЗУ завантажує зображення заново і
+створює НОВЕ вкладення в медіатеці - навіть якщо це той самий url, що й у
+попередньому запуску. Оскільки цей скрипт оновлює товари кожні кілька годин
+і щоразу заново шле src - за тижні це дає десятки тисяч дублікатів медіа.
+Тому тепер ведеться локальний кеш url -> attachment_id (media_cache.json):
+якщо url вже завантажувався раніше - шлемо {"id": id} (WooCommerce просто
+прив'язує вже наявне вкладення, нічого не перезавантажуючи); якщо це
+справді новий url - шлемо {"src": url} як і раніше, а отриманий у відповіді
+attachment_id одразу кешуємо на майбутнє.
+
+Це саме стосується і фото категорій: раніше воно виставлялось ТІЛЬКИ при
+створенні нової категорії - якщо категорія вже існувала в WooCommerce (навіть
+без фото, наприклад після ручного видалення вкладень), фото їй ніколи більше
+не пробувало виставитись. Тепер CategoryTree.resolve_from_chain() один раз
+за прогон донастановлює фото будь-якій існуючій категорії, у якої його немає.
 
 Запуск вручну:      python prom_woo_sync.py
 Запуск через cron:  0 */3 * * * /usr/bin/python3 /path/to/prom_woo_sync.py >> /var/log/prom_sync.log 2>&1
@@ -159,8 +162,14 @@ STATE_FILE = SCRIPT_DIR / "sync_state.json"
 # Сюди щоразу зберігається свіжий список товарів, для яких chain_for_product()
 # не знайшов ланцюжок у мапі партнера (тобто категорія була взята з
 # product_type фіда - "чужа" Prom-таксономія). Читає і обробляє цей файл
-# olibra_categories_scraper.py на своєму наступному (тижневому) запуску.
+# olibra_categories_scraper.py на своєму наступному запуску.
 ORPHANS_FILE = SCRIPT_DIR / "pending_orphans.json"
+
+# ---- ДЕДУПЛІКАЦІЯ МЕДІА ----
+# url зображення -> id вкладення в медіатеці WordPress. Дивись великий
+# коментар угорі файлу - без цього кешу WooCommerce плодить дублікати
+# медіа при кожному оновленні товару/категорії.
+MEDIA_CACHE_FILE = SCRIPT_DIR / "media_cache.json"
 
 # ---- ЗАХИСТ ВІД ПАРАЛЕЛЬНОГО ЗАПУСКУ ----
 # Потрібно, бо тепер синхронізацію можна запустити і за розкладом (cron/Task
@@ -251,6 +260,52 @@ def save_last_feed_count(count: int):
     STATE_FILE.write_text(json.dumps({"last_feed_count": count}), encoding="utf-8")
 
 
+def load_media_cache() -> dict:
+    if MEDIA_CACHE_FILE.exists():
+        try:
+            return json.loads(MEDIA_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            log.warning("Не вдалося прочитати %s - починаю з порожнього кешу медіа", MEDIA_CACHE_FILE)
+            return {}
+    return {}
+
+
+def save_media_cache(cache: dict):
+    MEDIA_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def resolve_image_refs(urls: list[str], media_cache: dict) -> tuple[list[dict], list[tuple[int, str]]]:
+    """Перетворює список url зображень у payload для WooCommerce.
+    Повертає (payload_images, misses), де misses - [(індекс, оригінальний_url), ...]
+    для тих зображень, яких ще немає в media_cache - їх треба буде закешувати
+    після отримання відповіді від WooCommerce (див. update_media_cache_from_response)."""
+    payload_images = []
+    misses = []
+    for i, url in enumerate(urls):
+        if not url:
+            continue
+        if url in media_cache:
+            payload_images.append({"id": media_cache[url]})
+        else:
+            payload_images.append({"src": url})
+            misses.append((i, url))
+    return payload_images, misses
+
+
+def update_media_cache_from_response(response_images: list[dict], misses: list[tuple[int, str]], media_cache: dict) -> bool:
+    """Після успішного create/update товару звіряє відповідь WooCommerce з
+    misses і дописує нові attachment_id в media_cache. Повертає True, якщо
+    кеш змінився (треба зберегти на диск)."""
+    changed = False
+    for idx, original_url in misses:
+        if idx < len(response_images):
+            attach_id = response_images[idx].get("id")
+            if attach_id:
+                media_cache[original_url] = attach_id
+                changed = True
+    return changed
+
+
 # ============================================================
 # МОДЕЛЬ ТОВАРУ
 # ============================================================
@@ -263,7 +318,7 @@ class FeedProduct:
     price: float
     in_stock: bool
     image: str
-    link: str = ""  # НОВЕ: потрібно, щоб діагностувати "сиріт" без повторного запиту до фіда
+    link: str = ""  # потрібно для діагностики "сиріт" без повторного запиту до фіда
     extra_images: list = field(default_factory=list)
     category_path: str = ""
     brand: str = ""
@@ -317,7 +372,7 @@ def fetch_feed_products() -> list[FeedProduct]:
             price=parse_price(g("price", "0")),
             in_stock=(g("availability") == "in stock"),
             image=g("image_link"),
-            link=g("link"),  # НОВЕ: точне посилання на товар з фіда
+            link=g("link"),
             extra_images=images,
             category_path=g("product_type"),
             brand=g("brand"),
@@ -336,6 +391,7 @@ class WooClient:
     def __init__(self, url: str, key: str, secret: str):
         self.base = f"{url}/wp-json/wc/v3"
         self.auth = (key, secret)
+        self.category_has_image: dict[int, bool] = {}  # заповнюється в get_all_categories()
 
     def get_all_products_by_sku(self) -> dict:
         """
@@ -367,18 +423,19 @@ class WooClient:
             page += 1
         return result
 
-    def create_product(self, payload: dict) -> int:
+    def create_product(self, payload: dict) -> dict:
         resp = _request_with_retry("POST", f"{self.base}/products", auth=self.auth, json=payload, timeout=60)
         if not resp.ok:
             log.error("Тіло відповіді WooCommerce: %s", resp.text[:500])
         resp.raise_for_status()
-        return resp.json()["id"]
+        return resp.json()
 
-    def update_product(self, product_id: int, payload: dict):
+    def update_product(self, product_id: int, payload: dict) -> dict:
         resp = _request_with_retry("PUT", f"{self.base}/products/{product_id}", auth=self.auth, json=payload, timeout=60)
         if not resp.ok:
             log.error("Тіло відповіді WooCommerce: %s", resp.text[:500])
         resp.raise_for_status()
+        return resp.json()
 
     def set_status(self, product_id: int, status: str):
         self.update_product(product_id, {"status": status})
@@ -388,7 +445,9 @@ class WooClient:
     # ------------------------------------------------------------
 
     def get_all_categories(self) -> dict:
-        """Повертає {(parent_id, name_lower): id} для всіх категорій, що вже є."""
+        """Повертає {(parent_id, name_lower): id} для всіх категорій, що вже є.
+        Заодно заповнює self.category_has_image, щоб CategoryTree знав, яким
+        категоріям бракує фото (наприклад, після ручного видалення вкладень)."""
         result = {}
         page = 1
         while True:
@@ -404,13 +463,14 @@ class WooClient:
                 break
             for c in batch:
                 result[(c["parent"], c["name"].strip().lower())] = c["id"]
+                self.category_has_image[c["id"]] = bool((c.get("image") or {}).get("src"))
             page += 1
         return result
 
-    def create_category(self, name: str, parent_id: int, image_url: str = "") -> int:
+    def create_category(self, name: str, parent_id: int, image_ref: dict | None = None) -> dict:
         payload = {"name": name, "parent": parent_id, "slug": slugify_uk(name)}
-        if image_url:
-            payload["image"] = {"src": image_url}
+        if image_ref:
+            payload["image"] = image_ref
         resp = _request_with_retry(
             "POST", f"{self.base}/products/categories",
             auth=self.auth,
@@ -420,7 +480,23 @@ class WooClient:
         if not resp.ok:
             log.error("Тіло відповіді WooCommerce (категорія '%s'): %s", name, resp.text[:500])
         resp.raise_for_status()
-        return resp.json()["id"]
+        data = resp.json()
+        self.category_has_image[data["id"]] = bool(image_ref)
+        return data
+
+    def update_category_image(self, category_id: int, image_ref: dict) -> dict:
+        resp = _request_with_retry(
+            "PUT", f"{self.base}/products/categories/{category_id}",
+            auth=self.auth,
+            json={"image": image_ref},
+            timeout=60,
+        )
+        if not resp.ok:
+            log.error("Тіло відповіді WooCommerce (фото категорії ID=%d): %s", category_id, resp.text[:500])
+        resp.raise_for_status()
+        data = resp.json()
+        self.category_has_image[category_id] = True
+        return data
 
 
 class CategoryTree:
@@ -433,9 +509,18 @@ class CategoryTree:
     створюються по ходу і додаються в той самий кеш.
     """
 
-    def __init__(self, wc: "WooClient"):
+    def __init__(self, wc: "WooClient", media_cache: dict):
         self.wc = wc
+        self.media_cache = media_cache
         self.cache = wc.get_all_categories()  # {(parent_id, name_lower): id}
+        self.image_touched: set[int] = set()  # категорії, чиє фото вже перевірене/виставлене цього прогону
+
+    def _image_ref(self, url: str) -> dict | None:
+        if not url:
+            return None
+        if url in self.media_cache:
+            return {"id": self.media_cache[url]}
+        return {"src": url}
 
     def resolve(self, category_path: str) -> Optional[int]:
         path = [part.strip() for part in category_path.split(">") if part.strip()]
@@ -454,7 +539,8 @@ class CategoryTree:
             if key in self.cache:
                 leaf_id = self.cache[key]
             else:
-                leaf_id = self.wc.create_category(name, parent_id)
+                data = self.wc.create_category(name, parent_id)
+                leaf_id = data["id"]
                 self.cache[key] = leaf_id
                 log.info("Створено категорію '%s' (батько ID=%d)", name, parent_id)
             parent_id = leaf_id
@@ -465,8 +551,12 @@ class CategoryTree:
         """
         Те саме, що resolve(), але приймає готовий ланцюжок [(назва, фото), ...]
         від кореня до листа - саме так, як його будує PartnerCategoryMap
-        з даних, зібраних olibra_categories_scraper.py (чи аналогічним
-        скриптом для іншого сайту-партнера).
+        з даних, зібраних olibra_categories_scraper.py.
+
+        Якщо категорія вже існує в магазині, але в неї немає фото (наприклад,
+        після ручного видалення вкладень) - фото донастановлюється один раз
+        за цей прогін (через self.image_touched, щоб не дьоргати WooCommerce
+        API повторно для кожного товару цієї ж категорії).
         """
         if not chain:
             return None
@@ -476,11 +566,29 @@ class CategoryTree:
             key = (parent_id, name.lower())
             if key in self.cache:
                 leaf_id = self.cache[key]
+                if image_url and leaf_id not in self.image_touched and not self.wc.category_has_image.get(leaf_id, False):
+                    img_ref = self._image_ref(image_url)
+                    is_new_upload = "src" in img_ref
+                    data = self.wc.update_category_image(leaf_id, img_ref)
+                    if is_new_upload:
+                        attach_id = (data.get("image") or {}).get("id")
+                        if attach_id:
+                            self.media_cache[image_url] = attach_id
+                    self.image_touched.add(leaf_id)
+                    log.info("Донастановлено фото існуючій категорії '%s' (ID=%d)", name, leaf_id)
             else:
-                leaf_id = self.wc.create_category(name, parent_id, image_url=image_url)
+                img_ref = self._image_ref(image_url) if image_url else None
+                is_new_upload = bool(img_ref) and "src" in img_ref
+                data = self.wc.create_category(name, parent_id, image_ref=img_ref)
+                leaf_id = data["id"]
                 self.cache[key] = leaf_id
+                if is_new_upload:
+                    attach_id = (data.get("image") or {}).get("id")
+                    if attach_id:
+                        self.media_cache[image_url] = attach_id
+                self.image_touched.add(leaf_id)
                 log.info("Створено категорію '%s' (батько ID=%d)%s", name, parent_id,
-                         " з фото" if image_url else "")
+                         " з фото" if img_ref else "")
             parent_id = leaf_id
         return leaf_id
 
@@ -532,9 +640,12 @@ class PartnerCategoryMap:
         return chain or None
 
 
-def build_payload(p: FeedProduct, category_id: Optional[int] = None) -> dict:
-    images = [{"src": p.image}] if p.image else []
-    images += [{"src": url} for url in p.extra_images]
+def build_payload(p: FeedProduct, media_cache: dict, category_id: Optional[int] = None) -> tuple[dict, list[tuple[int, str]]]:
+    """Повертає (payload, image_misses). image_misses треба звірити з
+    відповіддю WooCommerce після create/update, щоб дописати нові
+    attachment_id в media_cache (див. update_media_cache_from_response)."""
+    urls = ([p.image] if p.image else []) + list(p.extra_images)
+    images, misses = resolve_image_refs(urls, media_cache)
 
     payload = {
         "name": p.title,
@@ -559,7 +670,7 @@ def build_payload(p: FeedProduct, category_id: Optional[int] = None) -> dict:
     if category_id is not None:
         payload["categories"] = [{"id": category_id}]
 
-    return payload
+    return payload, misses
 
 
 # ============================================================
@@ -603,8 +714,12 @@ def sync():
 
     log.info("У WooCommerce вже є %d товарів з префіксом '%s'", len(existing), SKU_PREFIX)
 
+    media_cache = load_media_cache()
+    log.info("Кеш медіа: %d вже завантажених зображень", len(media_cache))
+    media_cache_dirty = False
+
     log.info("Завантажую/готую дерево категорій...")
-    categories = CategoryTree(wc)
+    categories = CategoryTree(wc, media_cache)
     partner_map = PartnerCategoryMap(
         SCRIPT_DIR / "olibra_categories.json",
         SCRIPT_DIR / "olibra_product_map.json",
@@ -617,7 +732,7 @@ def sync():
     created, updated, failed = 0, 0, 0
     seen_skus = set()
     missing_skus = set()
-    orphans: list[FeedProduct] = []  # НОВЕ: товари без ланцюжка з мапи партнера (fallback на product_type)
+    orphans: list[FeedProduct] = []  # товари без ланцюжка з мапи партнера (fallback на product_type)
 
     notifier.start(total=len(feed_products), label="Prom-sync: Olibra → WooCommerce")
 
@@ -631,13 +746,14 @@ def sync():
             elif p.category_path:
                 category_id = categories.resolve(p.category_path)
                 if partner_map.enabled:
-                    # НОВЕ: мапа партнера увімкнена, але саме для цього товару
+                    # Мапа партнера увімкнена, але саме для цього товару
                     # ланцюжка не знайшлось - фіксуємо як "сироту" для подальшого
                     # автоматичного аналізу скрапером (olibra_categories_scraper.py)
                     orphans.append(p)
         except requests.HTTPError as e:
             log.error("Не вдалося створити/знайти категорію для %s: %s", p.sku, e)
-        payload = build_payload(p, category_id)
+
+        payload, img_misses = build_payload(p, media_cache, category_id)
         try:
             if p.sku in existing:
                 # ВАЖЛИВО: не шлемо 'sku' при оновленні. Це офіційно підтверджений
@@ -646,17 +762,27 @@ def sync():
                 # трактується як "SKU вже зайнятий іншим товаром". SKU й так
                 # не змінюється при оновленні, тому просто прибираємо поле.
                 update_payload = {k: v for k, v in payload.items() if k not in ("sku", "slug")}
-                wc.update_product(existing[p.sku], update_payload)
+                result = wc.update_product(existing[p.sku], update_payload)
                 updated += 1
             else:
-                wc.create_product(payload)
+                result = wc.create_product(payload)
                 created += 1
+
+            if img_misses:
+                if update_media_cache_from_response(result.get("images", []), img_misses, media_cache):
+                    media_cache_dirty = True
         except requests.HTTPError as e:
             failed += 1
             log.error("Помилка для товару %s (%s): %s", p.sku, p.title, e)
             notifier.error(f"Товар {p.sku} ({p.title}): {e}")
 
         notifier.progress(processed=idx, added=created, updated=updated, errors=failed)
+
+        # Періодично зберігаємо кеш медіа, щоб не втратити накопичене при
+        # аварійному перериванні посеред довгого прогону.
+        if media_cache_dirty and idx % 50 == 0:
+            save_media_cache(media_cache)
+            media_cache_dirty = False
 
         if REQUEST_DELAY_SECONDS > 0:
             time.sleep(REQUEST_DELAY_SECONDS)
@@ -670,9 +796,12 @@ def sync():
             except requests.HTTPError as e:
                 log.error("Не вдалося приховати %s: %s", sku, e)
 
-    # НОВЕ: зберігаємо свіжий список "сиріт" - його прочитає і опрацює
-    # olibra_categories_scraper.py на своєму наступному запуску (self-healing
-    # прогресу для вже покритих TREE груп + пропозиції нових рядків для TREE).
+    if media_cache_dirty:
+        save_media_cache(media_cache)
+    log.info("Кеш медіа: %d записів після синхронізації", len(media_cache))
+
+    # Зберігаємо свіжий список "сиріт" - його прочитає і опрацює
+    # olibra_categories_scraper.py на своєму наступному запуску.
     orphans_out = [
         {"id": o.source_id, "title": o.title, "link": o.link, "category_path": o.category_path}
         for o in orphans
