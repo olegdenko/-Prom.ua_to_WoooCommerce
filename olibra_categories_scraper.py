@@ -200,12 +200,21 @@ OG_IMAGE_RE = re.compile(r'<meta property="og:image" content="([^"]+)"')
 
 # НОВЕ: посилання на ГРУПИ (не товари) - формат /ua/g<число>-<slug>, без .html.
 # Використовується для рекурсивного виявлення підкатегорій.
-GROUP_LINK_RE = re.compile(r'href="(?:https://olibra\.com\.ua)?/ua/(g\d+-[^"?#]+)"')
+#
+# ФІКС: сайт партнера для пагінації деяких груп використовує ШЛЯХ, а не
+# query-параметр (/ua/g4707120-paketi-dlya-smittya/page_2 замість
+# ?page=2). Стара регулярка [^"?#]+ дозволяла "/" усередині захопленого
+# slug'а, тому такі посилання на сторінки пагінації сприймались як окремі
+# НОВІ підкатегорії - звідси сміттєві категорії типу "g4707120-.../page_2"
+# з кривою назвою (сама пагінація підставлялась як назва, бо в неї немає
+# нормального title чи власного <h1>). Тепер "/" у slug'і заборонено -
+# group slug має бути ОДНИМ сегментом шляху, без вкладених "/".
+GROUP_LINK_RE = re.compile(r'href="(?:https://olibra\.com\.ua)?/ua/(g\d+-[^"/?#]+)"')
 # Якщо посилання на групу має атрибут title="..." (так зроблено у плитках
 # підкатегорій на сторінці групи) - беремо звідти чисту назву, без потреби
 # робити для цього окремий запит.
 GROUP_LINK_WITH_TITLE_RE = re.compile(
-    r'href="(?:https://olibra\.com\.ua)?/ua/(g\d+-[^"?#]+)"[^>]*title="([^"]+)"'
+    r'href="(?:https://olibra\.com\.ua)?/ua/(g\d+-[^"/?#]+)"[^>]*title="([^"]+)"'
 )
 H1_RE = re.compile(r"<h1[^>]*>([^<]+)</h1>")
 
@@ -288,9 +297,18 @@ def discover_children(slug: str, html: str, known_slugs: set[str]) -> list[tuple
             time.sleep(DELAY)
             if child_html:
                 m = H1_RE.search(child_html)
-                name = m.group(1).strip() if m else child_slug
-            else:
-                name = child_slug
+                name = m.group(1).strip() if m else None
+        if not name:
+            # ЗАХИСТ: якщо назву так і не вдалось знайти жодним способом -
+            # НЕ підставляємо сирий slug як назву (це і давало криві
+            # "категорії" типу самого посилання). Краще пропустити цей вузол
+            # і залишити попередження в лозі для ручної перевірки, ніж
+            # створити сміттєву категорію в WooCommerce.
+            log.warning(
+                "Не вдалося визначити назву для потенційної підкатегорії '%s' - пропускаю "
+                "(перевір вручну %s/ua/%s)", child_slug, BASE, child_slug,
+            )
+            continue
         result.append((name.strip(), child_slug))
     return result
 
