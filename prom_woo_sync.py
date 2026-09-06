@@ -655,7 +655,7 @@ def build_payload(p: FeedProduct, media_cache: dict, category_id: Optional[int] 
         "description": p.description,
         "short_description": p.description[:300],
         "manage_stock": True,
-        "stock_quantity": 10 if p.in_stock else 0,  # фід не завжди дає точний залишок
+        "stock_quantity": 1000 if p.in_stock else 0,  # фід не завжди дає точний залишок, кількість товару за замовчанням
         "stock_status": "instock" if p.in_stock else "outofstock",
         "status": "publish",
         "images": images,
