@@ -387,6 +387,13 @@ def fetch_feed_products() -> list[FeedProduct]:
 # КРОК 2. РОБОТА З WOOCOMMERCE REST API
 # ============================================================
 
+class ProductSkuConflict(Exception):
+    """Піднімається, коли WooCommerce відхиляє SKU як зайнятий (product_invalid_sku)."""
+    def __init__(self, sku: str, response_data: dict):
+        self.sku = sku
+        self.response_data = response_data
+        super().__init__(f"SKU '{sku}' вже зайнятий: {response_data}")
+
 class WooClient:
     def __init__(self, url: str, key: str, secret: str):
         self.base = f"{url}/wp-json/wc/v3"
@@ -409,7 +416,7 @@ class WooClient:
             resp = _request_with_retry(
                 "GET", f"{self.base}/products",
                 auth=self.auth,
-                params={"per_page": WC_PER_PAGE, "page": page},
+                params={"per_page": WC_PER_PAGE, "page": page, "status": "any"},
                 timeout=60,
             )
             resp.raise_for_status()
@@ -427,8 +434,30 @@ class WooClient:
         resp = _request_with_retry("POST", f"{self.base}/products", auth=self.auth, json=payload, timeout=60)
         if not resp.ok:
             log.error("Тіло відповіді WooCommerce: %s", resp.text[:500])
+            try:
+                error_data = resp.json()
+            except Exception:
+                error_data = {}
+            if error_data.get("code") == "product_invalid_sku":
+                raise ProductSkuConflict(payload.get("sku", ""), error_data)
         resp.raise_for_status()
         return resp.json()
+
+    def find_product_id_by_sku(self, sku: str) -> Optional[int]:
+        """Пряме опитування WooCommerce 'хто насправді власник цього SKU?' -
+        використовується як self-healing fallback, коли create/update падає з
+        product_invalid_sku (типово через розсинхрон таблиці wc_product_meta_lookup:
+        товар існує і опублікований, але наш локальний `existing` про нього не знав,
+        бо або в trash, або SKU змінювався і lookup застарів)."""
+        resp = _request_with_retry(
+            "GET", f"{self.base}/products",
+            auth=self.auth,
+            params={"sku": sku, "status": "any"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        return batch[0]["id"] if batch else None
 
     def update_product(self, product_id: int, payload: dict) -> dict:
         resp = _request_with_retry("PUT", f"{self.base}/products/{product_id}", auth=self.auth, json=payload, timeout=60)
@@ -754,6 +783,7 @@ def sync():
             log.error("Не вдалося створити/знайти категорію для %s: %s", p.sku, e)
 
         payload, img_misses = build_payload(p, media_cache, category_id)
+        result = None
         try:
             if p.sku in existing:
                 # ВАЖЛИВО: не шлемо 'sku' при оновленні. Це офіційно підтверджений
@@ -768,13 +798,47 @@ def sync():
                 result = wc.create_product(payload)
                 created += 1
 
-            if img_misses:
-                if update_media_cache_from_response(result.get("images", []), img_misses, media_cache):
-                    media_cache_dirty = True
+        except ProductSkuConflict as e:
+            # Self-healing: WooCommerce каже, що SKU зайнятий, хоча наш `existing`
+            # про це не знав (типово - товар у trash, або застарілий запис у
+            # таблиці wc_product_meta_lookup після ручної зміни SKU/видалення).
+            # Питаємо WooCommerce напряму, хто справжній власник SKU, і
+            # оновлюємо саме його замість того, щоб просто впасти з помилкою.
+            real_id = wc.find_product_id_by_sku(e.sku)
+            if real_id:
+                log.warning(
+                    "SKU %s зайнятий товаром ID=%d, якого не було в existing - "
+                    "оновлюю його напряму (self-healing)", e.sku, real_id,
+                )
+                try:
+                    update_payload = {k: v for k, v in payload.items() if k not in ("sku", "slug")}
+                    result = wc.update_product(real_id, update_payload)
+                    existing[p.sku] = real_id  # запам'ятати на решту цього прогону
+                    updated += 1
+                except requests.HTTPError as e2:
+                    failed += 1
+                    result = None
+                    log.error("Self-healing теж не вдався для %s: %s", p.sku, e2)
+                    notifier.error(f"Товар {p.sku} ({p.title}): не вдалося виправити SKU-конфлікт — {e2}")
+            else:
+                failed += 1
+                log.error(
+                    "SKU %s конфліктує, але WooCommerce не знайшов власника через ?sku= "
+                    "- ймовірно застарілий запис у wc_product_meta_lookup. "
+                    "Треба вручну: wp wc tool run regenerate_product_lookup_tables", e.sku,
+                )
+                notifier.error(
+                    f"Товар {p.sku} ({p.title}): SKU-конфлікт без видимого власника — потрібна ручна перевірка lookup-таблиці"
+                )
+
         except requests.HTTPError as e:
             failed += 1
             log.error("Помилка для товару %s (%s): %s", p.sku, p.title, e)
             notifier.error(f"Товар {p.sku} ({p.title}): {e}")
+
+        if result is not None and img_misses:
+            if update_media_cache_from_response(result.get("images", []), img_misses, media_cache):
+                media_cache_dirty = True
 
         notifier.progress(processed=idx, added=created, updated=updated, errors=failed)
 
