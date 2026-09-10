@@ -669,10 +669,17 @@ class PartnerCategoryMap:
         return chain or None
 
 
-def build_payload(p: FeedProduct, media_cache: dict, category_id: Optional[int] = None) -> tuple[dict, list[tuple[int, str]]]:
+def build_payload(p: FeedProduct, media_cache: dict, category_id: Optional[int] = None,
+                   is_update: bool = False) -> tuple[dict, list[tuple[int, str]]]:
     """Повертає (payload, image_misses). image_misses треба звірити з
     відповіддю WooCommerce після create/update, щоб дописати нові
-    attachment_id в media_cache (див. update_media_cache_from_response)."""
+    attachment_id в media_cache (див. update_media_cache_from_response).
+
+    is_update=True - НЕ включаємо description/short_description. Раніше опис
+    перезаписувався з фіда партнера ПРИ КОЖНІЙ синхронізації, що стирало
+    вручну відредаговане SEO-наповнення (напр. Rank Math: фокус-ключ,
+    розширений текст 600+ слів). Опис партнера тепер ставиться лише один
+    раз - при створенні товару."""
     urls = ([p.image] if p.image else []) + list(p.extra_images)
     images, misses = resolve_image_refs(urls, media_cache)
 
@@ -681,14 +688,15 @@ def build_payload(p: FeedProduct, media_cache: dict, category_id: Optional[int] 
         "sku": p.sku,
         "slug": f"{slugify_uk(p.title, max_length=50)}-{p.source_id}",
         "regular_price": str(p.sale_price),
-        "description": p.description,
-        "short_description": p.description[:300],
         "manage_stock": True,
         "stock_quantity": 1000 if p.in_stock else 0,  # фід не завжди дає точний залишок, кількість товару за замовчанням
         "stock_status": "instock" if p.in_stock else "outofstock",
         "status": "publish",
         "images": images,
     }
+    if not is_update:
+        payload["description"] = p.description
+        payload["short_description"] = p.description[:300]
 
     if p.attributes:
         payload["attributes"] = [
@@ -767,25 +775,38 @@ def sync():
 
     for idx, p in enumerate(feed_products, 1):
         seen_skus.add(p.sku)
+        is_update = p.sku in existing
         category_id = None
         try:
             chain = partner_map.chain_for_product(p.source_id)
             if chain:
                 category_id = categories.resolve_from_chain(chain)
-            elif p.category_path:
-                category_id = categories.resolve(p.category_path)
+            elif not is_update:
+                # НОВИЙ товар і немає партнерського ланцюжка - fallback на
+                # product_type з фіда (краще якась категорія, ніж нічого).
+                if p.category_path:
+                    category_id = categories.resolve(p.category_path)
                 if partner_map.enabled:
-                    # Мапа партнера увімкнена, але саме для цього товару
-                    # ланцюжка не знайшлось - фіксуємо як "сироту" для подальшого
-                    # автоматичного аналізу скрапером (olibra_categories_scraper.py)
+                    orphans.append(p)
+            else:
+                # ТОВАР ВЖЕ ІСНУЄ, партнерського ланцюжка досі немає -
+                # НЕ чіпаємо його поточну категорію в WooCommerce (не шлемо
+                # "categories" в payload). Раніше тут щодня наново ставився
+                # product_type з фіда - це "перекидало" товар назад у
+                # Prom-категорію навіть якщо адмін уже вручну виправив
+                # категорію в адмінці, і навіть якщо категорія просто ще не
+                # встигла з'явитись у партнерській мапі (скрапер біжить раз
+                # на тиждень). Товар лишається "сиротою" для аналізу
+                # скрапером, але категорію ми більше не форсуємо.
+                if partner_map.enabled:
                     orphans.append(p)
         except requests.HTTPError as e:
             log.error("Не вдалося створити/знайти категорію для %s: %s", p.sku, e)
 
-        payload, img_misses = build_payload(p, media_cache, category_id)
+        payload, img_misses = build_payload(p, media_cache, category_id, is_update=is_update)
         result = None
         try:
-            if p.sku in existing:
+            if is_update:
                 # ВАЖЛИВО: не шлемо 'sku' при оновленні. Це офіційно підтверджений
                 # баг WooCommerce (github.com/woocommerce/woocommerce/issues/33806) -
                 # PUT з тим самим SKU, який товар вже має, іноді помилково
