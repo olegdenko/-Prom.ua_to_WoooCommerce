@@ -64,6 +64,7 @@ Prom.ua, а не власну структуру груп на сайті пар
 
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -93,6 +94,13 @@ PROGRESS_FILE = OUT_DIR / "olibra_scrape_progress.json"
 # відсутність самої категорії в дереві.
 ORPHANS_FILE = OUT_DIR / "pending_orphans.json"
 DELAY_ORPHAN_CHECK = 0.5
+
+# Лок-файл - щоб не запустити два скрапери одночасно (напр. одночасний
+# тижневий cron і ручний/telegram-запуск) - інакше вони битимуться за
+# запис у ті самі JSON-файли. За зразком LOCK_FILE у prom_woo_sync.py.
+# Поріг застарілості з запасом вище звичайної тривалості (10-20+ хв).
+LOCK_FILE = OUT_DIR / "scrape.lock"
+LOCK_STALE_SECONDS = 60 * 60  # 1 година
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("olibra_scraper")
@@ -515,8 +523,22 @@ def main():
 
 
 if __name__ == "__main__":
+    if LOCK_FILE.exists() and (time.time() - LOCK_FILE.stat().st_mtime) < LOCK_STALE_SECONDS:
+        log.warning(
+            "Скрапер вже виконується (лок-файл %s не старший за %d хв) - "
+            "виходжу, щоб не накластися на попередній запуск.",
+            LOCK_FILE, LOCK_STALE_SECONDS // 60,
+        )
+        sys.exit(1)
+
+    LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
     try:
         main()
     except KeyboardInterrupt:
         log.info("Перервано користувачем - прогрес збережено, можна запустити знову.")
         sys.exit(1)
+    finally:
+        try:
+            LOCK_FILE.unlink()
+        except FileNotFoundError:
+            pass
