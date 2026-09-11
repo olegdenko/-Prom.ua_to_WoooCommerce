@@ -21,6 +21,7 @@ telegram_commands.py
     /scrape  - примусово запустити скрапер категорій партнера (10-20+ хв,
                якщо він вже не виконується і не виконується /sync)
     /status  - показати, чи виконується синхронізація і/або скрапер зараз
+    /help    - список команд
 
 Розраховано на запуск короткими інтервалами (напр. кожну 1 хвилину) через
 Windows Task Scheduler - так само, як prom_woo_sync.py вже запускається за
@@ -183,6 +184,15 @@ def start_scrape() -> None:
     _run_detached(SCRAPE_SCRIPT, "Скрапер категорій")
 
 
+HELP_TEXT = (
+    "Доступні команди:\n"
+    "/sync — примусово запустити синхронізацію Prom→WooCommerce\n"
+    "/scrape — примусово запустити скрапер категорій партнера (10-20+ хв)\n"
+    "/status — чи виконується зараз синхронізація і/або скрапер\n"
+    "/help — цей список команд"
+)
+
+
 def handle_update(update: dict) -> None:
     msg = update.get("message") or update.get("channel_post")
     if not msg:
@@ -202,6 +212,8 @@ def handle_update(update: dict) -> None:
         sync_line = "⏳ Синхронізація зараз виконується." if sync_in_progress() else "✅ Синхронізація не виконується."
         scrape_line = "⏳ Скрапер категорій зараз виконується." if scrape_in_progress() else "✅ Скрапер категорій не виконується."
         send(f"{sync_line}\n{scrape_line}")
+    elif text in ("/help", "/start", "/допомога"):
+        send(HELP_TEXT)
 
 
 def main() -> None:
