@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -113,16 +114,44 @@ def scrape_in_progress() -> bool:
     return _lock_active(SCRAPE_LOCK_FILE, SCRAPE_LOCK_STALE_SECONDS)
 
 
-def _run_detached(script: Path) -> None:
-    # DETACHED_PROCESS - щоб дочірній скрипт продовжив працювати незалежно
-    # від цього короткоживучого скрипта (cron/Task Scheduler завершить
-    # telegram_commands.py одразу після перевірки, а sync/scrape триватиме
-    # довше).
-    creationflags = subprocess.DETACHED_PROCESS if os.name == "nt" else 0
+def _run_detached(script: Path, label: str) -> None:
+    """Запускає script у фоні (detached, незалежно від цього
+    короткоживучого telegram_commands.py) і, на POSIX (Ubuntu, де зараз
+    реально живе проєкт), додатково шле в Telegram повідомлення про
+    завершення - успіх/помилка і скільки часу зайняло. Це окремий
+    detached bash-ланцюжок, тому не потребує, щоб сам telegram_commands.py
+    чекав на завершення довгого sync/scrape."""
+    if os.name == "nt":
+        # Завершальне повідомлення на Windows не реалізовано (bat-еквівалент
+        # ланцюжка нижче виглядав би суттєво складніше, а актуальний прод -
+        # Ubuntu/cron) - запускаємо як і раніше, без нотифікації про фініш.
+        subprocess.Popen(
+            [sys.executable, str(script)],
+            cwd=str(SCRIPT_DIR),
+            creationflags=subprocess.DETACHED_PROCESS,
+            close_fds=True,
+        )
+        return
+
+    python_q = shlex.quote(sys.executable)
+    script_q = shlex.quote(str(script))
+    chat_id_q = shlex.quote(TELEGRAM_CHAT_ID)
+    label_q = label.replace('"', "")  # для тексту повідомлення, лапки прибираємо про всяк випадок
+
+    bash_cmd = (
+        f"START=$(date +%s); "
+        f"{python_q} {script_q}; "
+        f"RC=$?; "
+        f"ELAPSED=$(( $(date +%s) - START )); "
+        f'if [ $RC -eq 0 ]; then MSG="✅ {label_q}: готово за $((ELAPSED/60))хв $((ELAPSED%60))с."; '
+        f'else MSG="❌ {label_q}: помилка (код $RC), минуло $((ELAPSED/60))хв $((ELAPSED%60))с. Дивись лог на сервері."; fi; '
+        f'curl -s -X POST "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage" '
+        f'-d chat_id={chat_id_q} --data-urlencode "text=$MSG" > /dev/null'
+    )
     subprocess.Popen(
-        [sys.executable, str(script)],
+        ["/bin/bash", "-c", bash_cmd],
         cwd=str(SCRIPT_DIR),
-        creationflags=creationflags,
+        start_new_session=True,  # POSIX-еквівалент detach - переживе завершення цього процесу
         close_fds=True,
     )
 
@@ -137,7 +166,7 @@ def start_sync() -> None:
         return
 
     send("🚀 Запускаю синхронізацію вручну (команда з Telegram)...")
-    _run_detached(SYNC_SCRIPT)
+    _run_detached(SYNC_SCRIPT, "Синхронізація")
 
 
 def start_scrape() -> None:
@@ -150,9 +179,8 @@ def start_scrape() -> None:
         return
 
     send("🚀 Запускаю скрапер категорій партнера вручну (команда з Telegram)... "
-         "Це довго (10-20+ хв). Перевірити прогрес/завершення можна командою /status "
-         "або в /var/log/olibra_categories.log на сервері.")
-    _run_detached(SCRAPE_SCRIPT)
+         "Це довго (10-20+ хв), напишу коли завершиться.")
+    _run_detached(SCRAPE_SCRIPT, "Скрапер категорій")
 
 
 def handle_update(update: dict) -> None:
@@ -168,11 +196,12 @@ def handle_update(update: dict) -> None:
 
     if text in ("/sync", "/sync_now", "/синхронізація"):
         start_sync()
+    elif text in ("/scrape", "/scrape_now", "/скрапер", "/категорії"):
+        start_scrape()
     elif text == "/status":
-        if sync_in_progress():
-            send("⏳ Синхронізація зараз виконується.")
-        else:
-            send("✅ Зараз синхронізація не виконується.")
+        sync_line = "⏳ Синхронізація зараз виконується." if sync_in_progress() else "✅ Синхронізація не виконується."
+        scrape_line = "⏳ Скрапер категорій зараз виконується." if scrape_in_progress() else "✅ Скрапер категорій не виконується."
+        send(f"{sync_line}\n{scrape_line}")
 
 
 def main() -> None:
