@@ -18,7 +18,9 @@ telegram_commands.py
 
 Перевіряє нові повідомлення в Telegram і виконує команди:
     /sync    - примусово запустити синхронізацію (якщо вона вже не виконується)
-    /status  - показати, чи виконується синхронізація зараз
+    /scrape  - примусово запустити скрапер категорій партнера (10-20+ хв,
+               якщо він вже не виконується і не виконується /sync)
+    /status  - показати, чи виконується синхронізація і/або скрапер зараз
 
 Розраховано на запуск короткими інтервалами (напр. кожну 1 хвилину) через
 Windows Task Scheduler - так само, як prom_woo_sync.py вже запускається за
@@ -62,9 +64,14 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 SYNC_SCRIPT = SCRIPT_DIR / "prom_woo_sync.py"
+SCRAPE_SCRIPT = SCRIPT_DIR / "olibra_categories_scraper.py"
 OFFSET_FILE = SCRIPT_DIR / "telegram_offset.json"
+
 LOCK_FILE = SCRIPT_DIR / "sync.lock"  # той самий lock-файл, що й у prom_woo_sync.py
 LOCK_STALE_SECONDS = 2 * 60 * 60      # має збігатись зі значенням у prom_woo_sync.py
+
+SCRAPE_LOCK_FILE = SCRIPT_DIR / "scrape.lock"  # той самий lock-файл, що й у olibra_categories_scraper.py
+SCRAPE_LOCK_STALE_SECONDS = 60 * 60            # має збігатись зі значенням там же
 
 API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -91,30 +98,61 @@ def save_offset(offset: int) -> None:
     OFFSET_FILE.write_text(json.dumps({"offset": offset}), encoding="utf-8")
 
 
-def sync_in_progress() -> bool:
-    if not LOCK_FILE.exists():
+def _lock_active(lock_file: Path, stale_seconds: int) -> bool:
+    if not lock_file.exists():
         return False
-    age = time.time() - LOCK_FILE.stat().st_mtime
-    return age < LOCK_STALE_SECONDS
+    age = time.time() - lock_file.stat().st_mtime
+    return age < stale_seconds
+
+
+def sync_in_progress() -> bool:
+    return _lock_active(LOCK_FILE, LOCK_STALE_SECONDS)
+
+
+def scrape_in_progress() -> bool:
+    return _lock_active(SCRAPE_LOCK_FILE, SCRAPE_LOCK_STALE_SECONDS)
+
+
+def _run_detached(script: Path) -> None:
+    # DETACHED_PROCESS - щоб дочірній скрипт продовжив працювати незалежно
+    # від цього короткоживучого скрипта (cron/Task Scheduler завершить
+    # telegram_commands.py одразу після перевірки, а sync/scrape триватиме
+    # довше).
+    creationflags = subprocess.DETACHED_PROCESS if os.name == "nt" else 0
+    subprocess.Popen(
+        [sys.executable, str(script)],
+        cwd=str(SCRIPT_DIR),
+        creationflags=creationflags,
+        close_fds=True,
+    )
 
 
 def start_sync() -> None:
     if sync_in_progress():
         send("⏳ Синхронізація вже виконується — зачекайте на завершення поточного запуску.")
         return
+    if scrape_in_progress():
+        send("⏳ Зараз виконується скрапер категорій (/scrape) — синхронізація читає його файли, "
+             "тому зачекайте на завершення скрапера і повторіть /sync.")
+        return
 
     send("🚀 Запускаю синхронізацію вручну (команда з Telegram)...")
+    _run_detached(SYNC_SCRIPT)
 
-    # DETACHED_PROCESS - щоб prom_woo_sync.py продовжив працювати незалежно
-    # від цього короткоживучого скрипта (Task Scheduler завершить
-    # telegram_commands.py одразу після перевірки, а sync триватиме довше).
-    creationflags = subprocess.DETACHED_PROCESS if os.name == "nt" else 0
-    subprocess.Popen(
-        [sys.executable, str(SYNC_SCRIPT)],
-        cwd=str(SCRIPT_DIR),
-        creationflags=creationflags,
-        close_fds=True,
-    )
+
+def start_scrape() -> None:
+    if scrape_in_progress():
+        send("⏳ Скрапер категорій вже виконується — зачекайте на завершення поточного запуску.")
+        return
+    if sync_in_progress():
+        send("⏳ Зараз виконується синхронізація (/sync) — скрапер не можна запускати паралельно "
+             "(обидва читають/пишуть pending_orphans.json), зачекайте на завершення і повторіть /scrape.")
+        return
+
+    send("🚀 Запускаю скрапер категорій партнера вручну (команда з Telegram)... "
+         "Це довго (10-20+ хв). Перевірити прогрес/завершення можна командою /status "
+         "або в /var/log/olibra_categories.log на сервері.")
+    _run_detached(SCRAPE_SCRIPT)
 
 
 def handle_update(update: dict) -> None:
