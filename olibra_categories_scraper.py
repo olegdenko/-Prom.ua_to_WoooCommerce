@@ -76,6 +76,10 @@ import requests
 BASE = "https://olibra.com.ua"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CategoryMapBot/1.0)"}
 DELAY = 1.0  # пауза між запитами (секунди) - ввічливо до сервера партнера
+RESCAN_INTERVAL_DAYS = 14  # раз на стільки днів примусово пересканувати навіть
+                            # уже "готові" групи (children_checked/done_groups),
+                            # щоб ловити нові підкатегорії/товари, які self-healing
+                            # через pending_orphans.json не покриває
 MAX_PAGES_PER_GROUP = 60  # запобіжник від нескінченного циклу пагінації
 MAX_DISCOVERED_NODES = 3000  # запобіжник від "втечі" рекурсії, якщо десь на
                               # сторінці випадково знайдеться посилання, що не
@@ -330,7 +334,43 @@ def load_progress() -> dict:
     data.setdefault("images", {})            # slug -> image_url (як і раніше)
     data.setdefault("children_checked", [])  # НОВЕ: slug'и, для яких вже пройшло виявлення дітей
     data.setdefault("discovered", [])        # НОВЕ: [[name, slug, parent_slug], ...] знайдені рекурсією
+    data.setdefault("children_checked_ts", {})  # slug -> unix-час останньої перевірки дітей
+    data.setdefault("done_groups_ts", {})       # slug -> unix-час останнього сканування товарів групи
     return data
+
+
+def purge_stale_progress(progress: dict, children_checked: set[str]) -> None:
+    """Раз на RESCAN_INTERVAL_DAYS примусово "забуває" вже готові групи, щоб
+    вони пересканувались заново в цьому ж запуску - інакше children_checked і
+    done_groups кешуються НАЗАВЖДИ, і нові підкатегорії/товари під давно
+    обробленою батьківською групою можуть залишитись непоміченими, навіть
+    коли self-healing через pending_orphans.json їх не зловив (напр. товар
+    ще жодного разу не потрапляв у "сироти", бо його додали разом з новою
+    групою, яку прогін синку ще не бачив).
+    """
+    cutoff = time.time() - RESCAN_INTERVAL_DAYS * 86400
+    ts_children = progress["children_checked_ts"]
+    ts_groups = progress["done_groups_ts"]
+
+    stale_children = [slug for slug in list(children_checked)
+                       if ts_children.get(slug, 0) < cutoff]
+    for slug in stale_children:
+        children_checked.discard(slug)
+        ts_children.pop(slug, None)
+
+    stale_groups = [slug for slug in list(progress["done_groups"].keys())
+                     if ts_groups.get(slug, 0) < cutoff]
+    for slug in stale_groups:
+        progress["done_groups"].pop(slug, None)
+        ts_groups.pop(slug, None)
+
+    if stale_children or stale_groups:
+        log.info(
+            "Плановий пересканінг (>%d днів): %d батьківських груп на виявлення дітей, "
+            "%d груп товарів - будуть пройдені заново в цьому запуску",
+            RESCAN_INTERVAL_DAYS, len(stale_children), len(stale_groups),
+        )
+        save_progress(progress)
 
 
 def save_progress(progress: dict):
@@ -413,6 +453,11 @@ def main():
 
     known_slugs = {slug for _, slug, _ in TREE} | {slug for _, slug, _ in discovered}
 
+    # Плановий пересканінг: раз на RESCAN_INTERVAL_DAYS "забуваємо" застарілі
+    # готові групи, щоб гарантовано ловити нові підкатегорії/товари навіть
+    # там, де self-healing через orphans нічого не запідозрив.
+    purge_stale_progress(progress, children_checked)
+
     # Self-healing застарілого прогресу для сиріт з prom_woo_sync.py (перед
     # основним обходом, щоб скинуті групи одразу пересканувались нижче).
     process_pending_orphans(progress, known_slugs)
@@ -453,6 +498,7 @@ def main():
                 log.info("  знайдено нову підкатегорію: '%s' (%s), батько '%s'", child_name, child_slug, slug)
 
         children_checked.add(slug)
+        progress["children_checked_ts"][slug] = time.time()
         processed_in_queue += 1
         if processed_in_queue % 10 == 0:
             progress["children_checked"] = sorted(children_checked)
@@ -501,6 +547,7 @@ def main():
         log.info("Товари групи: %s (%s)", name, slug)
         ids = get_product_ids_for_group(slug, first_page_html=first_page_cache.get(slug))
         done_groups[slug] = sorted(ids)
+        progress["done_groups_ts"][slug] = time.time()
         save_progress(progress)
         log.info("  -> %d товарів знайдено", len(ids))
 
