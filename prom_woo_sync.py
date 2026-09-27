@@ -43,7 +43,7 @@ from typing import Optional
 import requests
 
 from telegram_notify import TelegramNotifier
-from seo_generator import process_single_product, is_seo_disabledt
+from seo_generator import process_single_product, is_seo_disabled
 
 try:
     from dotenv import load_dotenv  # type: ignore
