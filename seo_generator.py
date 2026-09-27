@@ -171,15 +171,22 @@ def update_product_rank_math_seo(product: dict) -> bool:
     return False
 
 
-def process_single_product(product_id: int, enforce_sku: bool = True) -> bool:
+def process_single_product(product_id: int, enforce_sku: bool = True, overwrite: bool = False) -> bool:
     """
     Точка входу для інтеграції з prom_woo_sync.py.
     Викликати одразу після успішного create_product()/update_product() для товару.
+
+    overwrite=False (за замовчуванням) — товар з уже заповненим SEO (в т.ч. вручну
+        адміністратором) пропускається, ніяких змін.
+    overwrite=True — SEO перегенерується й перезаписується, навіть якщо вже було
+        заповнено вручну. Використовувати свідомо (наприклад, за окремою командою
+        в telegram_commands.py на кшталт /seo_refresh <product_id>), а не автоматично
+        при кожному sync().
+
     Приклад:
         response = woo_client.create_product(product_data)
         if response.status_code == 201:
-            new_product = response.json()
-            process_single_product(new_product["id"])
+            process_single_product(response.json()["id"])
     """
     try:
         res = wcapi.get(f"products/{product_id}")
@@ -197,15 +204,21 @@ def process_single_product(product_id: int, enforce_sku: bool = True) -> bool:
         log.info(f"Пропуск ID {product_id} — SKU не належить SKU_PREFIX={SKU_PREFIX!r}")
         return False
 
-    if _has_seo(product):
-        log.info(f"Пропуск ID {product_id} — SEO вже заповнено.")
+    if _has_seo(product) and not overwrite:
+        log.info(f"Пропуск ID {product_id} — SEO вже заповнено (в т.ч. можливо вручну).")
         return False
 
     return update_product_rank_math_seo(product)
 
 
-def process_all_unfilled_products(enforce_sku: bool = True, per_page: int = 50):
-    """Масова обробка товарів без SEO (перший повний прогін / ручний запуск --all)."""
+def process_all_unfilled_products(enforce_sku: bool = True, per_page: int = 50, overwrite: bool = False):
+    """
+    Масова обробка товарів (перший повний прогін / ручний запуск --all).
+    overwrite=False — обробляються тільки товари БЕЗ SEO (звичайний режим).
+    overwrite=True  — перегенеруються ВСІ товари, що підпадають під SKU_PREFIX,
+        включно з тими, де SEO вже виставлено вручну. Використовувати обережно,
+        краще спершу на конкретному --product-id.
+    """
     page = 1
     processed = skipped = failed = 0
 
@@ -232,7 +245,7 @@ def process_all_unfilled_products(enforce_sku: bool = True, per_page: int = 50):
             if not _owns_product(product, enforce_sku):
                 skipped += 1
                 continue
-            if _has_seo(product):
+            if _has_seo(product) and not overwrite:
                 log.info(f"Пропуск ID {product['id']} — SEO вже заповнено.")
                 skipped += 1
                 continue
@@ -256,13 +269,18 @@ def _cli():
         action="store_true",
         help="Не обмежуватись SKU_PREFIX — обробляти будь-які товари (обережно!)",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Перезаписати SEO навіть там, де воно вже є (в т.ч. виставлене вручну)",
+    )
     args = parser.parse_args()
     enforce_sku = not args.all_sku
 
     if args.product_id:
-        process_single_product(args.product_id, enforce_sku=enforce_sku)
+        process_single_product(args.product_id, enforce_sku=enforce_sku, overwrite=args.overwrite)
     elif args.all:
-        process_all_unfilled_products(enforce_sku=enforce_sku)
+        process_all_unfilled_products(enforce_sku=enforce_sku, overwrite=args.overwrite)
     else:
         parser.print_help()
         sys.exit(1)
