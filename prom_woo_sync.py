@@ -43,7 +43,7 @@ from typing import Optional
 import requests
 
 from telegram_notify import TelegramNotifier
-from seo_generator import process_single_product
+from seo_generator import process_single_product, is_seo_disabledt
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -819,6 +819,7 @@ def sync():
             else:
                 result = wc.create_product(payload)
                 created += 1
+                process_single_product(result["id"])  # SEO для щойно створеного товару
 
         except ProductSkuConflict as e:
             # Self-healing: WooCommerce каже, що SKU зайнятий, хоча наш `existing`
@@ -899,6 +900,9 @@ def sync():
     )
 
     save_last_feed_count(len(feed_products))
+
+    if is_seo_disabled():
+        notify_telegram(f"⚠️ Prom-sync: SEO-генерація вимкнена під час цього прогону — {is_seo_disabled()}")
 
     summary = (
         f"Готово. Створено: {created}, оновлено: {updated}, помилок: {failed}, "
