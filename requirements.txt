@@ -9,3 +9,9 @@ requests>=2.31.0,<3.0.0
 # Завантаження налаштувань із .env / prom_woo_sync.env
 
 python-dotenv>=1.0.0,<2.0.0
+
+# WooCommerce REST API клієнт (seo_generator.py)
+woocommerce>=3.0.0,<4.0.0
+
+# OpenAI API клієнт (seo_generator.py)
+openai>=1.30.0,<2.0.0
