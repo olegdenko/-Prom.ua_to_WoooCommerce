@@ -197,7 +197,44 @@ def _category_links(product: dict) -> str:
         name = c.get("name")
         if slug and name:
             links.append(f'- {name}: {WC_URL}/product-category/{slug}/')
-    return "\n".join(links) if links else "(немає категорій — посилань не вставляй)"
+    return "\n".join(links) if links else "(немає категорій — внутрішніх посилань не вставляй)"
+
+
+# Невеликий, СВІДОМО обмежений і вручну перевірений список зовнішніх
+# посилань на статті Вікіпедії про матеріали. GPT сам URL НЕ вигадує —
+# тільки обирає (максимум одне) зі списку нижче за збігом ключових слів
+# у назві/категоріях товару. Це навмисно, щоб ніколи не отримати бите
+# посилання: розширюйте список самі під свій асортимент за тим самим
+# принципом — перевірений вручну URL, а не згенерований моделлю.
+EXTERNAL_LINK_WHITELIST: list[tuple[list[str], str, str]] = [
+    (["дерев'ян", "дерево", "деревин"], "Деревина", "https://uk.wikipedia.org/wiki/Деревина"),
+    (["поліпропілен", "пластик"], "Поліпропілен", "https://uk.wikipedia.org/wiki/Поліпропілен"),
+    (["паперов", "папір"], "Папір", "https://uk.wikipedia.org/wiki/Папір"),
+    (["картон"], "Картон", "https://uk.wikipedia.org/wiki/Картон"),
+    (["целюлоз", "бамбук", "тростин"], "Целюлоза", "https://uk.wikipedia.org/wiki/Целюлоза"),
+]
+
+
+def _external_link(product: dict) -> str:
+    """Підбирає ОДНЕ перевірене зовнішнє посилання за ключовими словами в
+    назві/категоріях товару, або повертає порожньо, якщо збігу немає."""
+    haystack = (product.get("name", "") + " " + " ".join(
+        c.get("name", "") for c in product.get("categories", [])
+    )).lower()
+    for keywords, label, url in EXTERNAL_LINK_WHITELIST:
+        if any(kw in haystack for kw in keywords):
+            return f"{label}: {url}"
+    return "(немає релевантного — зовнішнього посилання не вставляй)"
+
+
+def _focus_keyword(product: dict) -> str:
+    """Фокусне ключове слово, яке вже згенерував seo_generator.py (якщо
+    його ще немає — модуль опису однаково працює, просто без жорсткої
+    прив'язки до фрази; тому рекомендовано спершу запускати fill_seo())."""
+    for m in product.get("meta_data", []):
+        if m.get("key") == "rank_math_focus_keyword" and m.get("value"):
+            return m["value"]
+    return ""
 
 
 def generate_description_html(product: dict) -> str | None:
@@ -210,6 +247,18 @@ def generate_description_html(product: dict) -> str | None:
     categories = ", ".join(c["name"] for c in product.get("categories", []))
     source_description = _TAG_RE.sub("", product.get("description", "") or "")[:600]
     links = _category_links(product)
+    external_link = _external_link(product)
+    focus_keyword = _focus_keyword(product)
+
+    keyword_block = (
+        f'Фокусне ключове слово для цього товару: "{focus_keyword}". ОБОВ\'ЯЗКОВО:\n'
+        f'- вжити цю точну фразу в першому реченні тексту;\n'
+        f'- вжити її дослівно щонайменше в одному з заголовків <h2>;\n'
+        f'- природно повторити її ще 2-3 рази по тексту (не більше, без переспаму).'
+        if focus_keyword else
+        "Фокусного ключового слова для товару ще не згенеровано (запустіть спочатку "
+        "seo_generator.py) — пиши без жорсткої прив'язки до конкретної фрази."
+    )
 
     prompt = f"""
 Ти контент-маркетолог інтернет-магазину DENKO (одноразовий посуд та HoReCa-товари).
@@ -221,9 +270,16 @@ def generate_description_html(product: dict) -> str | None:
 - Категорії: {categories or "не вказано"}
 - Короткий опис від постачальника (лише контекст, не копіюй дослівно): {source_description or "не надано"}
 
-Дозволені посилання на категорії (використовуй ТІЛЬКИ ці, природно вплітаючи
-в текст 1-2 з них; нових URL не вигадуй, якщо список порожній — обійдись без посилань):
+{keyword_block}
+
+Дозволені внутрішні посилання на категорії (використовуй ТІЛЬКИ ці, природно
+вплітаючи в текст 1-2 з них; нових URL не вигадуй):
 {links}
+
+Дозволене ЗОВНІШНЄ посилання (використай РІВНО ОДИН РАЗ, якщо воно надане
+нижче і дійсно релевантне — атрибути target="_blank" rel="noopener", БЕЗ
+rel="nofollow"; якщо написано "немає релевантного" — зовнішніх посилань не додавай):
+{external_link}
 
 Обов'язкова структура:
 1. Вступний абзац (2-3 речення), назва товару виділена <strong>.
@@ -235,7 +291,8 @@ def generate_description_html(product: dict) -> str | None:
 4. Завершальний абзац із закликом до дії.
 
 Жорсткі вимоги:
-- 350-550 слів живого тексту.
+- МІНІМУМ 600 слів живого тексту (Rank Math вимагає не менше 600 — це важливо,
+  не скорочуй розділи).
 - НЕ вигадуй конкретні характеристики (розміри, матеріал, сертифікати), яких
   не було в наданих даних — якщо їх не передано, пиши узагальнено, без цифр.
 - Тон практичний, для B2B/HoReCa аудиторії, без перебільшень.
@@ -253,9 +310,23 @@ def generate_description_html(product: dict) -> str | None:
             html = response.choices[0].message.content.strip()
             # На випадок якщо модель все ж обгорне відповідь у ```html ... ```
             html = re.sub(r"^```(?:html)?\s*|\s*```$", "", html.strip())
-            if _text_length(html) < 100:
+
+            word_count = len(_TAG_RE.sub(" ", html).split())
+            has_kw = (not focus_keyword) or (focus_keyword.lower() in _TAG_RE.sub(" ", html).lower())
+            if word_count < 100:
                 log.error("Відповідь OpenAI підозріло коротка, пропускаю")
                 return None
+            if (word_count < 550 or not has_kw) and attempt < MAX_RETRIES:
+                log.warning(
+                    f"Спроба {attempt}: опис не пройшов перевірку "
+                    f"(слів: {word_count}, ключове слово присутнє: {has_kw}), повторюю"
+                )
+                continue
+            if word_count < 550 or not has_kw:
+                log.warning(
+                    f"Опис збережено із зауваженнями (слів: {word_count}, "
+                    f"ключове слово присутнє: {has_kw}) — Rank Math може досі скаржитись"
+                )
             return html
 
         except RateLimitError as e:
@@ -286,6 +357,18 @@ def generate_description_html(product: dict) -> str | None:
     return None
 
 
+def _build_image_alt_payload(product: dict, focus_keyword: str) -> list[dict] | None:
+    """Той самий принцип, що й у seo_generator.py: проставляє alt-текст
+    (фокусне слово + назва товару) наявним зображенням товару, зберігаючи
+    їхні id/порядок. Дублюється навмисно — щоб alt виставлявся навіть якщо
+    цей модуль запускають окремо, без seo_generator.py."""
+    images = product.get("images", [])
+    if not images or not focus_keyword:
+        return None
+    alt_text = f"{focus_keyword} — {product.get('name', '')}"[:125]
+    return [{"id": img["id"], "alt": alt_text} for img in images if img.get("id")]
+
+
 def update_product_description(product: dict) -> bool:
     """Записує згенерований опис у товар. Ніколи не кидає виняток назовні."""
     try:
@@ -296,7 +379,12 @@ def update_product_description(product: dict) -> bool:
         if not html:
             return False
 
-        res = wcapi.put(f"products/{p_id}", {"description": html})
+        payload = {"description": html}
+        img_payload = _build_image_alt_payload(product, _focus_keyword(product))
+        if img_payload:
+            payload["images"] = img_payload
+
+        res = wcapi.put(f"products/{p_id}", payload)
         if res.status_code == 200:
             log.info(f"✅ Опис успішно оновлено для ID {p_id} ({_text_length(html)} символів тексту)")
             return True
