@@ -87,7 +87,7 @@ DESC_OPENAI_MODEL = os.environ.get("DESC_OPENAI_MODEL", "gpt-4o-mini")
 DESC_REQUEST_DELAY = float(os.environ.get("DESC_REQUEST_DELAY", "1.0"))
 # Скільки символів "живого" тексту (без HTML-тегів) вважати "вже повним
 # описом", який більше не чіпаємо без --overwrite.
-DESCRIPTION_MIN_WORDS = int(os.environ.get("DESCRIPTION_MIN_WORDS", "500"))
+DESCRIPTION_MIN_WORDS = int(os.environ.get("DESCRIPTION_MIN_WORDS", "600"))
 MAX_RETRIES = 3
 
 SEO_ENABLED = True
