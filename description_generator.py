@@ -23,7 +23,7 @@ is_update=True не включає ці поля) — тобто наступн�
   - Ніколи не кидає виняток назовні з process_single_product()/process_all_*().
   - При вичерпанні коштів/ліміту OpenAI чи невалідному ключі — одразу вимикається
     до кінця поточного запуску (не б'ється в закриті двері 1400 разів).
-  - За замовчуванням товар з уже "повним" описом (довшим за DESCRIPTION_MIN_LENGTH
+  - За замовчуванням товар з уже "повним" описом (не менше DESCRIPTION_MIN_WORDS
     символів) ПРОПУСКАЄТЬСЯ — байдуже, наш це був опис чи вручну написаний.
     Перезапис — тільки свідомо, через overwrite=True / --overwrite.
 
@@ -87,7 +87,7 @@ DESC_OPENAI_MODEL = os.environ.get("DESC_OPENAI_MODEL", "gpt-4o-mini")
 DESC_REQUEST_DELAY = float(os.environ.get("DESC_REQUEST_DELAY", "1.0"))
 # Скільки символів "живого" тексту (без HTML-тегів) вважати "вже повним
 # описом", який більше не чіпаємо без --overwrite.
-DESCRIPTION_MIN_LENGTH = int(os.environ.get("DESCRIPTION_MIN_LENGTH", "400"))
+DESCRIPTION_MIN_WORDS = int(os.environ.get("DESCRIPTION_MIN_WORDS", "500"))
 MAX_RETRIES = 3
 
 SEO_ENABLED = True
@@ -178,8 +178,14 @@ def _text_length(html: str) -> int:
     return len(_TAG_RE.sub("", html or "").strip())
 
 
+def _word_count(html: str) -> int:
+    """Кількість слів живого тексту (без HTML-тегів) — та сама метрика, за
+    якою рахує Rank Math, на відміну від довжини в символах."""
+    return len(_TAG_RE.sub(" ", html or "").split())
+
+
 def _has_full_description(product: dict) -> bool:
-    return _text_length(product.get("description", "")) >= DESCRIPTION_MIN_LENGTH
+    return _word_count(product.get("description", "")) >= DESCRIPTION_MIN_WORDS
 
 
 def _owns_product(product: dict, enforce_sku: bool) -> bool:
@@ -311,7 +317,7 @@ rel="nofollow"; якщо написано "немає релевантного" 
             # На випадок якщо модель все ж обгорне відповідь у ```html ... ```
             html = re.sub(r"^```(?:html)?\s*|\s*```$", "", html.strip())
 
-            word_count = len(_TAG_RE.sub(" ", html).split())
+            word_count = _word_count(html)
             has_kw = (not focus_keyword) or (focus_keyword.lower() in _TAG_RE.sub(" ", html).lower())
             if word_count < 100:
                 log.error("Відповідь OpenAI підозріло коротка, пропускаю")
@@ -434,7 +440,7 @@ def process_single_product(product_id: int, enforce_sku: bool = True, overwrite:
         return False
 
     if _has_full_description(product) and not overwrite:
-        log.info(f"Пропуск ID {product_id} — опис уже повний (≥{DESCRIPTION_MIN_LENGTH} символів).")
+        log.info(f"Пропуск ID {product_id} — опис уже повний (≥{DESCRIPTION_MIN_WORDS} слів).")
         return False
 
     return update_product_description(product)
