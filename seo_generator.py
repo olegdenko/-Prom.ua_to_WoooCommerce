@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import sys
 import json
+import re
 import time
 import argparse
 import logging
@@ -80,6 +81,16 @@ SKU_PREFIX = os.environ.get("SKU_PREFIX", "OLB-")
 OPENAI_MODEL = os.environ.get("SEO_OPENAI_MODEL", "gpt-4o-mini")
 REQUEST_DELAY = float(os.environ.get("SEO_REQUEST_DELAY", "1.0"))
 MAX_RETRIES = 3
+
+# ---------------------------------------------------------------------------
+# Виправлення занадто довгого slug (permalink). ВИМКНЕНО ЗА ЗАМОВЧУВАННЯМ — max_length рахується для САМОГО slug (без
+# домену/шляху). ⚠️ УВАГА: зміна slug на вже опублікованому й
+# проіндексованому товарі змінює його URL. WordPress НЕ створює редирект
+# зі старої адреси автоматично — якщо на товар уже є зовнішні посилання чи
+# він в індексі Google, поставте плагін типу Redirection ПЕРЕД масовим
+# запуском, або лишіть FIX_SLUG=false і застосовуйте --fix-slug вибірково.
+FIX_SLUG = os.environ.get("FIX_SLUG", "false").strip().lower() in ("1", "true", "yes")
+SLUG_MAX_LENGTH = int(os.environ.get("SLUG_MAX_LENGTH", "45"))
 
 # ---------------------------------------------------------------------------
 # М'яка ініціалізація: НІЧОГО тут не кидає виняток при імпорті. Якщо чогось
@@ -201,7 +212,20 @@ def _owns_product(product: dict, enforce_sku: bool) -> bool:
     return sku.startswith(SKU_PREFIX)
 
 
-def _validate_seo(data: dict) -> list[str]:
+_STOPWORDS_UK = {
+    "для", "шт", "мл", "см", "мм", "кг", "від", "та", "і", "й", "з", "із",
+    "у", "в", "на", "по", "до", "або", "це", "не",
+}
+
+
+def _significant_title_tokens(title: str) -> set[str]:
+    """Слова з назви товару довші за 2 символи, без стоп-слів і чисто
+    числових токенів (розміри окремо не рахуємо як 'специфічні')."""
+    tokens = re.findall(r"[a-zA-Zа-яіїєґА-ЯІЇЄҐ0-9]+", (title or "").lower())
+    return {t for t in tokens if len(t) > 2 and t not in _STOPWORDS_UK}
+
+
+def _validate_seo(data: dict, product_title: str = "") -> list[str]:
     """Легка перевірка якості того, що повернув GPT — не блокує збереження,
     але дає сигнал для повтору спроби чи для логів."""
     problems = []
@@ -213,7 +237,54 @@ def _validate_seo(data: dict) -> list[str]:
         problems.append("фокусне слово відсутнє в тексті meta-опису")
     if not kw:
         problems.append("фокусне слово порожнє")
+
+    # Специфічність: фокусне слово має містити хоча б одне характерне слово
+    # з назви товару (бренд, модель, об'єм тощо), інакше воно однакове для
+    # десятків схожих товарів у каталозі (напр. просто "гель для душу").
+    title_tokens = _significant_title_tokens(product_title)
+    kw_tokens = set(re.findall(r"[a-zA-Zа-яіїєґА-ЯІЇЄҐ0-9]+", kw.lower()))
+    if title_tokens and kw and not (kw_tokens & title_tokens):
+        problems.append(
+            "фокусне слово занадто загальне — не містить жодного специфічного "
+            "слова з назви товару (бренд/модель/об'єм)"
+        )
     return problems
+
+
+def _shorten_slug(current_slug: str, max_length: int) -> str | None:
+    """Скорочує slug до max_length символів по межі слова, зберігаючи
+    останній сегмент, якщо він числовий (source_id з фіда партнера — це те,
+    що гарантує унікальність URL серед схожих товарів; його ЗАВЖДИ лишаємо).
+    Повертає None, якщо скорочення не потрібне."""
+    if not current_slug or len(current_slug) <= max_length:
+        return None
+
+    parts = current_slug.split("-")
+    if parts and parts[-1].isdigit():
+        suffix, head_parts = parts[-1], parts[:-1]
+    else:
+        suffix, head_parts = None, parts
+
+    budget = max_length - (len(suffix) + 1 if suffix else 0)
+    if budget <= 0:
+        # Навіть сам ID ледве влазить — нічого кращого зробити не можемо.
+        return current_slug[:max_length].rstrip("-") or "item"
+
+    kept, used = [], 0
+    for word in head_parts:
+        add = len(word) + (1 if kept else 0)
+        if used + add > budget:
+            break
+        kept.append(word)
+        used += add
+
+    if not kept and head_parts:
+        kept = [head_parts[0][:budget]]
+
+    new_slug = "-".join(kept)
+    if suffix:
+        new_slug = f"{new_slug}-{suffix}" if new_slug else suffix
+    return (new_slug or current_slug[:max_length].rstrip("-")) or "item"
 
 
 def _build_image_alt_payload(product: dict, focus_keyword: str) -> list[dict] | None:
@@ -242,7 +313,7 @@ def generate_seo_metadata(product_title: str, categories: str, short_description
 Вимоги:
 1. SEO Title: До 55-60 символів, обов'язково із закінченням " — DENKO". Не використовуй слово "одноразова".
 2. Meta Description: РІВНО 140-160 символів (не коротше 140!), з природним закликом до дії (Купуйте в DENKO!). Фокусне ключове слово ОБОВ'ЯЗКОВО має дослівно зустрічатися в тексті цього опису.
-3. Focus Keyword: Основна ключова фраза нижнім регістром, 2-4 слова, така, що природно звучить у звичайному тексті (не сухий технічний термін) — вона буде вжита в основному описі товару.
+3. Focus Keyword: 2-4 слова, нижнім регістром, природна фраза (не сухий термін). ОБОВ'ЯЗКОВО має бути СПЕЦИФІЧНОЮ саме для цього товару — включати бренд, модель, варіант чи об'єм із назви, якщо вони там є. У каталозі десятки схожих товарів (наприклад, багато різних гелів для душу різних брендів) — тому загальна фраза на кшталт "гель для душу" НЕ підходить, вона однакова для всіх. Приклад: для товару "Гель для душу Old Spice 400мл епік ледженг" фокус має бути на кшталт "гель для душу old spice epic legend", а НЕ просто "гель для душу".
 
 Відповідай СУВОРО у форматі JSON:
 {{
@@ -260,7 +331,7 @@ def generate_seo_metadata(product_title: str, categories: str, short_description
                 temperature=0.3,
             )
             seo_data = json.loads(response.choices[0].message.content)
-            problems = _validate_seo(seo_data)
+            problems = _validate_seo(seo_data, product_title)
             if problems and attempt < MAX_RETRIES:
                 log.warning(f"Спроба {attempt}: SEO-дані не пройшли перевірку ({'; '.join(problems)}), повторюю")
                 continue
@@ -327,6 +398,15 @@ def update_product_rank_math_seo(product: dict) -> bool:
         img_payload = _build_image_alt_payload(product, seo_data["focus_keyword"])
         if img_payload:
             payload["images"] = img_payload
+
+        if FIX_SLUG:
+            new_slug = _shorten_slug(product.get("slug", ""), SLUG_MAX_LENGTH)
+            if new_slug:
+                payload["slug"] = new_slug
+                log.warning(
+                    f"✂️ Slug ID {p_id} скорочено: '{product.get('slug')}' → '{new_slug}' "
+                    f"(стара URL-адреса товару перестане працювати без редиректу!)"
+                )
 
         res = wcapi.put(f"products/{p_id}", payload)
         if res.status_code == 200:
@@ -470,7 +550,16 @@ def _cli():
         "--check", action="store_true",
         help="Тільки перевірити налаштування (ключі, пакети) і вийти",
     )
+    parser.add_argument(
+        "--fix-slug", action="store_true",
+        help="Скорочувати занадто довгий slug (permalink) до SLUG_MAX_LENGTH. "
+             "УВАГА: змінює URL уже опублікованих товарів без редиректу.",
+    )
     args = parser.parse_args()
+
+    if args.fix_slug:
+        global FIX_SLUG
+        FIX_SLUG = True
 
     if args.check:
         if SEO_ENABLED:
