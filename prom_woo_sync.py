@@ -687,7 +687,7 @@ def build_payload(p: FeedProduct, media_cache: dict, category_id: Optional[int] 
     payload = {
         "name": p.title,
         "sku": p.sku,
-        "slug": f"{slugify_uk(p.title, max_length=50)}-{p.source_id}",
+        "slug": f"{slugify_uk(p.title, max_length=45 - len(str(p.source_id)) - 1)}",
         "regular_price": str(p.sale_price),
         "manage_stock": True,
         "stock_quantity": 1000 if p.in_stock else 0,  # фід не завжди дає точний залишок, кількість товару за замовчанням
