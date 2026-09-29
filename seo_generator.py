@@ -201,6 +201,31 @@ def _owns_product(product: dict, enforce_sku: bool) -> bool:
     return sku.startswith(SKU_PREFIX)
 
 
+def _validate_seo(data: dict) -> list[str]:
+    """Легка перевірка якості того, що повернув GPT — не блокує збереження,
+    але дає сигнал для повтору спроби чи для логів."""
+    problems = []
+    desc = (data or {}).get("description", "") or ""
+    kw = (data or {}).get("focus_keyword", "") or ""
+    if not (135 <= len(desc) <= 165):
+        problems.append(f"довжина опису {len(desc)} символів поза межами 135-165")
+    if kw and kw.lower() not in desc.lower():
+        problems.append("фокусне слово відсутнє в тексті meta-опису")
+    if not kw:
+        problems.append("фокусне слово порожнє")
+    return problems
+
+
+def _build_image_alt_payload(product: dict, focus_keyword: str) -> list[dict] | None:
+    """Формує список images з проставленим alt-текстом (фокусне слово +
+    назва товару), зберігаючи id/порядок наявних зображень товару."""
+    images = product.get("images", [])
+    if not images or not focus_keyword:
+        return None
+    alt_text = f"{focus_keyword} — {product.get('name', '')}"[:125]
+    return [{"id": img["id"], "alt": alt_text} for img in images if img.get("id")]
+
+
 def generate_seo_metadata(product_title: str, categories: str, short_description: str = ""):
     """Генерує SEO title/description/focus_keyword через OpenAI. Ніколи не кидає
     виняток — повертає None при будь-якій проблемі."""
@@ -216,8 +241,8 @@ def generate_seo_metadata(product_title: str, categories: str, short_description
 
 Вимоги:
 1. SEO Title: До 55-60 символів, обов'язково із закінченням " — DENKO". Не використовуй слово "одноразова".
-2. Meta Description: До 145-150 символів із закликом до дії (Купуйте в DENKO!).
-3. Focus Keyword: Основна ключова фраза нижнім регістром.
+2. Meta Description: РІВНО 140-160 символів (не коротше 140!), з природним закликом до дії (Купуйте в DENKO!). Фокусне ключове слово ОБОВ'ЯЗКОВО має дослівно зустрічатися в тексті цього опису.
+3. Focus Keyword: Основна ключова фраза нижнім регістром, 2-4 слова, така, що природно звучить у звичайному тексті (не сухий технічний термін) — вона буде вжита в основному описі товару.
 
 Відповідай СУВОРО у форматі JSON:
 {{
@@ -234,7 +259,14 @@ def generate_seo_metadata(product_title: str, categories: str, short_description
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
             )
-            return json.loads(response.choices[0].message.content)
+            seo_data = json.loads(response.choices[0].message.content)
+            problems = _validate_seo(seo_data)
+            if problems and attempt < MAX_RETRIES:
+                log.warning(f"Спроба {attempt}: SEO-дані не пройшли перевірку ({'; '.join(problems)}), повторюю")
+                continue
+            if problems:
+                log.warning(f"SEO-дані збережено із зауваженнями: {'; '.join(problems)}")
+            return seo_data
 
         except RateLimitError as e:
             if _is_quota_exhausted(e):
@@ -292,6 +324,9 @@ def update_product_rank_math_seo(product: dict) -> bool:
                 {"key": META_KEYS["focus_keyword"], "value": seo_data["focus_keyword"]},
             ]
         }
+        img_payload = _build_image_alt_payload(product, seo_data["focus_keyword"])
+        if img_payload:
+            payload["images"] = img_payload
 
         res = wcapi.put(f"products/{p_id}", payload)
         if res.status_code == 200:
