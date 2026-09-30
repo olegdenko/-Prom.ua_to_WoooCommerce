@@ -43,7 +43,8 @@ from typing import Optional
 import requests
 
 from telegram_notify import TelegramNotifier
-from seo_generator import process_single_product, is_seo_disabled
+from seo_generator import process_single_product as fill_seo, is_seo_disabled
+from description_generator import process_single_product as fill_description, is_description_disabled
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -687,7 +688,7 @@ def build_payload(p: FeedProduct, media_cache: dict, category_id: Optional[int] 
     payload = {
         "name": p.title,
         "sku": p.sku,
-        "slug": f"{slugify_uk(p.title, max_length=50 - len(str(p.source_id)) - 1)}",
+        "slug": slugify_uk(p.title, max_length=45),
         "regular_price": str(p.sale_price),
         "manage_stock": True,
         "stock_quantity": 1000 if p.in_stock else 0,  # фід не завжди дає точний залишок, кількість товару за замовчанням
@@ -819,7 +820,8 @@ def sync():
             else:
                 result = wc.create_product(payload)
                 created += 1
-                process_single_product(result["id"])  # SEO для щойно створеного товару
+                fill_seo(result["id"])  # SEO для щойно створеного товару
+                fill_description(result["id"])
 
         except ProductSkuConflict as e:
             # Self-healing: WooCommerce каже, що SKU зайнятий, хоча наш `existing`
