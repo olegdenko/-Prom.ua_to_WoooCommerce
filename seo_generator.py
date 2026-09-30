@@ -62,6 +62,39 @@ except Exception:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / "prom_woo_sync.env"
+PROMPTS_DIR = SCRIPT_DIR / "prompts"
+
+_DEFAULT_SEO_PROMPT = """Ти SEO-фахівець інтернет-магазину DENKO.
+Згенеруй SEO метадані українською мовою для товару:
+- Назва товару: {{TITLE}}
+- Категорії: {{CATEGORIES}}
+- Опис: {{SHORT_DESCRIPTION}}
+
+Вимоги:
+1. SEO Title: До 55-60 символів, обов'язково із закінченням " — DENKO". Не використовуй слово "одноразова".
+2. Meta Description: РІВНО 140-160 символів (не коротше 140!), з природним закликом до дії (Купуйте в DENKO!). Фокусне ключове слово ОБОВ'ЯЗКОВО має дослівно зустрічатися в тексті цього опису.
+3. Focus Keyword: 2-4 слова, нижнім регістром, природна фраза (не сухий термін). ОБОВ'ЯЗКОВО має бути СПЕЦИФІЧНОЮ саме для цього товару — включати бренд, модель, варіант чи об'єм із назви, якщо вони там є. Приклад: для "Гель для душу Old Spice 400мл епік ледженг" фокус має бути на кшталт "гель для душу old spice epic legend", а НЕ просто "гель для душу".
+
+Відповідай СУВОРО у форматі JSON:
+{
+    "title": "...",
+    "description": "...",
+    "focus_keyword": "..."
+}
+"""
+
+
+def _load_prompt_template(filename: str, fallback: str) -> str:
+    """Читає текстовий шаблон промпту з /prompts/{filename}. Якщо файл
+    відсутній чи пошкоджений — використовує вбудований запасний варіант,
+    щоб зникнення/помилка в текстовому файлі ніколи не зупиняла генерацію."""
+    path = PROMPTS_DIR / filename
+    try:
+        text = path.read_text(encoding="utf-8")
+        return text if text.strip() else fallback
+    except Exception as e:
+        log.warning(f"Не вдалось прочитати {path} ({e}), використовую вбудований промпт")
+        return fallback
 load_dotenv(ENV_PATH)  # тихо: якщо файлу немає — просто працюємо з тим, що вже в os.environ
 
 logging.basicConfig(
@@ -231,8 +264,8 @@ def _validate_seo(data: dict, product_title: str = "") -> list[str]:
     problems = []
     desc = (data or {}).get("description", "") or ""
     kw = (data or {}).get("focus_keyword", "") or ""
-    if not (135 <= len(desc) <= 165):
-        problems.append(f"довжина опису {len(desc)} символів поза межами 135-165")
+    if not (120 <= len(desc) <= 160):
+        problems.append(f"довжина опису {len(desc)} символів поза межами 120-160")
     if kw and kw.lower() not in desc.lower():
         problems.append("фокусне слово відсутнє в тексті meta-опису")
     if not kw:
@@ -310,25 +343,13 @@ def generate_seo_metadata(product_title: str, categories: str, short_description
     if not _seo_available():
         return None
 
-    prompt = f"""
-Ти SEO-фахівець інтернет-магазину DENKO.
-Згенеруй SEO метадані українською мовою для товару:
-- Назва товару: {product_title}
-- Категорії: {categories}
-- Опис: {short_description}
-
-Вимоги:
-1. SEO Title: До 55-60 символів, обов'язково із закінченням " — DENKO". Не використовуй слово "одноразова".
-2. Meta Description: РІВНО 140-160 символів (не коротше 140!), з природним закликом до дії (Купуйте в DENKO!). Фокусне ключове слово ОБОВ'ЯЗКОВО має дослівно зустрічатися в тексті цього опису.
-3. Focus Keyword: 2-4 слова, нижнім регістром, природна фраза (не сухий термін). ОБОВ'ЯЗКОВО має бути СПЕЦИФІЧНОЮ саме для цього товару — включати бренд, модель, варіант чи об'єм із назви, якщо вони там є. У каталозі десятки схожих товарів (наприклад, багато різних гелів для душу різних брендів) — тому загальна фраза на кшталт "гель для душу" НЕ підходить, вона однакова для всіх. Приклад: для товару "Гель для душу Old Spice 400мл епік ледженг" фокус має бути на кшталт "гель для душу old spice epic legend", а НЕ просто "гель для душу".
-
-Відповідай СУВОРО у форматі JSON:
-{{
-    "title": "...",
-    "description": "...",
-    "focus_keyword": "..."
-}}
-"""
+    template = _load_prompt_template("seo_prompt.txt", _DEFAULT_SEO_PROMPT)
+    prompt = (
+        template
+        .replace("{{TITLE}}", product_title)
+        .replace("{{CATEGORIES}}", categories)
+        .replace("{{SHORT_DESCRIPTION}}", short_description or "не надано")
+    )
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = client.chat.completions.create(
@@ -589,10 +610,6 @@ def _cli():
     else:
         parser.print_help()
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    _cli()
 
 
 if __name__ == "__main__":
