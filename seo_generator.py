@@ -288,12 +288,19 @@ def _shorten_slug(current_slug: str, max_length: int) -> str | None:
 
 
 def _build_image_alt_payload(product: dict, focus_keyword: str) -> list[dict] | None:
-    """Формує список images з проставленим alt-текстом (фокусне слово +
-    назва товару), зберігаючи id/порядок наявних зображень товару."""
+    """Формує список images з alt-текстом, зберігаючи id/порядок зображень.
+    Якщо фокусне слово вже фактично міститься в назві товару (а це майже
+    завжди так, бо ми навмисно робимо фокус-слово специфічним щодо назви) —
+    використовуємо ТІЛЬКИ назву, без дублювання однакового тексту двічі."""
     images = product.get("images", [])
-    if not images or not focus_keyword:
+    name = (product.get("name", "") or "").strip()
+    if not images or not name:
         return None
-    alt_text = f"{focus_keyword} — {product.get('name', '')}"[:125]
+    if focus_keyword and focus_keyword.lower() not in name.lower():
+        alt_text = f"{focus_keyword} — {name}"
+    else:
+        alt_text = name
+    alt_text = alt_text[:125]
     return [{"id": img["id"], "alt": alt_text} for img in images if img.get("id")]
 
 
@@ -582,6 +589,10 @@ def _cli():
     else:
         parser.print_help()
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    _cli()
 
 
 if __name__ == "__main__":
